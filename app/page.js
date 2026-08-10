@@ -84,7 +84,7 @@ function Chart({ rows, now }) {
   const x = t => padL + ((t - t0) / (now - t0)) * (w - padL - padR);
   const y = v => padT + (1 - (v - lo) / (hi - lo)) * (h - padT - padB);
 
-  const step = hi - lo > 2.5 ? 0.5 : 0.25;
+  const step = hi - lo < 2.5 ? 0.25 : 0.5;
   const yTicks = [];
   for (let v = Math.ceil(lo / step) * step; v <= hi; v += step) {
     yTicks.push(Number(v.toFixed(2)));
