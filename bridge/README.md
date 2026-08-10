@@ -14,6 +14,12 @@ Opret ~/farm-dashboard/bridge/.env med:
     INGEST_URL=https://farm-dashboard.vercel.app/api/ingest
     INGEST_TOKEN=...
     INTERVAL_SECONDS=300
+    LIVE_URL=https://farm-dashboard.vercel.app/api/live
+    LIVE_INTERVAL_SECONDS=15
+
+`LIVE_URL` er live-visningen paa dashboardet; udelades den, springes
+live-opdateringerne over. `LIVE_INTERVAL_SECONDS` (standard 15) er den
+korteste tid mellem to live-POST'er.
 
 Laas filen ned og start tjenesten:
 

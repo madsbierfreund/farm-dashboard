@@ -1,4 +1,5 @@
 import { createClient } from '@supabase/supabase-js';
+import LiveReading from './LiveReading';
 
 export const dynamic = 'force-dynamic';
 
@@ -43,20 +44,14 @@ export default async function Page() {
         <p style={{ opacity: 0.6 }}>Ingen målinger endnu.</p>
       ) : (
         <>
-          <div style={{ display: 'flex', alignItems: 'baseline', gap: 20 }}>
-            <span style={{ fontSize: 68, fontWeight: 600, lineHeight: 1.1 }}>
-              {latest.ph.toFixed(2)}
-            </span>
-            {latest.temp != null && (
-              <span style={{ fontSize: 24, opacity: 0.55 }}>
-                {latest.temp.toFixed(1)} °C
-              </span>
-            )}
-          </div>
-
-          <div style={{ opacity: 0.5, fontSize: 13, marginBottom: 28 }}>
-            Målt {fmtTime(latest.t)} · {fmtAgo(now - latest.t)}
-          </div>
+          <LiveReading
+            initial={{
+              ph: latest.ph,
+              temp: latest.temp,
+              updatedAt: new Date(latest.t).toISOString(),
+              ageMs: now - latest.t
+            }}
+          />
 
           <Chart rows={rows} now={now} />
 
@@ -182,23 +177,4 @@ function fmtClock(t) {
     minute: '2-digit',
     timeZone: TZ
   });
-}
-
-function fmtTime(t) {
-  return new Date(t).toLocaleString('da-DK', {
-    day: '2-digit',
-    month: 'short',
-    hour: '2-digit',
-    minute: '2-digit',
-    timeZone: TZ
-  });
-}
-
-function fmtAgo(ms) {
-  const min = Math.round(ms / 60000);
-  if (min < 1) return 'lige nu';
-  if (min < 60) return `for ${min} min. siden`;
-  const h = Math.round(min / 60);
-  if (h < 24) return `for ${h} t. siden`;
-  return `for ${Math.round(h / 24)} d. siden`;
 }

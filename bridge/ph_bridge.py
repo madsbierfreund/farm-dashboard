@@ -19,6 +19,10 @@ INGEST_URL = os.environ["INGEST_URL"]
 INGEST_TOKEN = os.environ["INGEST_TOKEN"]
 INTERVAL = int(os.environ.get("INTERVAL_SECONDS", "300"))
 
+# Live-visning: hurtige, ikke-loggede opdateringer til dashboardet.
+LIVE_URL = os.environ.get("LIVE_URL")
+LIVE_INTERVAL = int(os.environ.get("LIVE_INTERVAL_SECONDS", "15"))
+
 TOPICS = {
     "farm/ph_node/sensor/ph/state": "ph",
     "farm/ph_node/sensor/ph_voltage/state": "ph_voltage",
@@ -27,6 +31,10 @@ TOPICS = {
 
 lock = threading.Lock()
 buffer = {"ph": [], "ph_voltage": [], "water_temperature": []}
+# Seneste kendte vaerdi pr. felt til live-visningen (ikke median).
+latest = {"ph": None, "ph_voltage": None, "water_temperature": None}
+# Monotont tidsstempel for sidste live-POST, saa vi kan begraense frekvensen.
+live_marker = {"last": 0.0}
 
 
 def on_connect(client, userdata, flags, reason_code, properties=None):
@@ -48,6 +56,9 @@ def on_message(client, userdata, msg):
         return
     with lock:
         buffer[field].append(value)
+        latest[field] = value
+    if field == "ph":
+        maybe_send_live()
 
 
 def send(payload):
@@ -70,6 +81,52 @@ def send(payload):
         print(f"netvaerksfejl: {err}", flush=True)
 
 
+def live_send(snapshot):
+    """POSTer de seneste vaerdier til live-endpointet. Kaldes paa en worker-traad."""
+    if snapshot["ph"] is None:
+        return
+    payload = {"ph": round(snapshot["ph"], 3)}
+    for field in ("ph_voltage", "water_temperature"):
+        if snapshot[field] is not None:
+            payload[field] = round(snapshot[field], 4)
+
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        LIVE_URL,
+        data=data,
+        headers={
+            "content-type": "application/json",
+            "x-ingest-token": INGEST_TOKEN,
+        },
+        method="POST",
+    )
+    # Ingen success-log her: dette koerer hvert ~15 s og ville oversvoemme journalen.
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except urllib.error.HTTPError as err:
+        print(f"live http-fejl {err.code}: {err.read().decode()[:200]}", flush=True)
+    except Exception as err:
+        print(f"live netvaerksfejl: {err}", flush=True)
+
+
+def maybe_send_live():
+    """Sender en live-opdatering, dog hoejst en gang pr. LIVE_INTERVAL sekunder.
+
+    Selve POST'et sker paa en daemon-traad, saa en langsom eller fejlende
+    forespoergsel aldrig blokerer MQTT-callbacket.
+    """
+    if not LIVE_URL:
+        return
+    moment = time.monotonic()
+    with lock:
+        if moment - live_marker["last"] < LIVE_INTERVAL:
+            return
+        live_marker["last"] = moment
+        snapshot = dict(latest)
+    threading.Thread(target=live_send, args=(snapshot,), daemon=True).start()
+
+
 def flush_loop():
     while True:
         time.sleep(INTERVAL)
@@ -90,6 +147,9 @@ def flush_loop():
 
 
 def main():
+    if not LIVE_URL:
+        print("LIVE_URL ikke sat - live-visning deaktiveret", flush=True)
+
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     client.username_pw_set(USER, PASSWORD)
     client.on_connect = on_connect
