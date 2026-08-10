@@ -1,38 +1,74 @@
 import { createClient } from '@supabase/supabase-js';
 import LiveReading from './LiveReading';
+import ChartZoom from './ChartZoom';
 
 export const dynamic = 'force-dynamic';
 
-const TZ = 'Europe/Copenhagen';
-const TARGET_LO = 5.8;
-const TARGET_HI = 6.3;
+// Valgbare tidsvinduer. Nøglen ligger i URL'ens ?range=... så et genindlæst
+// eller bogmærket link husker valget.
+const RANGES = {
+  '1h': { label: '1 time', ms: 3600e3 },
+  '6h': { label: '6 timer', ms: 6 * 3600e3 },
+  '1d': { label: '1 dag', ms: 24 * 3600e3 },
+  '1w': { label: '1 uge', ms: 7 * 24 * 3600e3 },
+  '1m': { label: '1 måned', ms: 30 * 24 * 3600e3 }
+};
+const DEFAULT_RANGE = '1d';
+const MAX_POINTS = 400;
 
-export default async function Page() {
+export default async function Page({ searchParams }) {
+  const sp = (await searchParams) ?? {};
+  const rangeParam = Array.isArray(sp.range) ? sp.range[0] : sp.range;
+  const range = RANGES[rangeParam] ? rangeParam : DEFAULT_RANGE;
+
   const db = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_SERVICE_ROLE_KEY
   );
 
   const now = Date.now();
-  const since = new Date(now - 24 * 3600 * 1000).toISOString();
+  const windowStart = now - RANGES[range].ms;
+  const since = new Date(windowStart).toISOString();
 
-  const { data, error } = await db
-    .from('ph_readings')
-    .select('recorded_at, ph, water_temperature')
-    .gte('recorded_at', since)
-    .order('recorded_at', { ascending: true });
+  // Vinduet til grafen/statistikken + den nyeste måling til live-tallet
+  // (uafhængigt af det valgte vindue, så tallet altid er korrekt).
+  const [windowRes, latestRes] = await Promise.all([
+    db
+      .from('ph_readings')
+      .select('recorded_at, ph, water_temperature')
+      .gte('recorded_at', since)
+      .order('recorded_at', { ascending: true }),
+    db
+      .from('ph_readings')
+      .select('recorded_at, ph, water_temperature')
+      .order('recorded_at', { ascending: false })
+      .limit(1)
+  ]);
 
-  if (error) {
-    return <main style={{ padding: 24 }}>Fejl: {error.message}</main>;
+  if (windowRes.error) {
+    return <main style={{ padding: 24 }}>Fejl: {windowRes.error.message}</main>;
   }
 
-  const rows = (data ?? []).map(r => ({
+  const rows = (windowRes.data ?? []).map(r => ({
     t: new Date(r.recorded_at).getTime(),
     ph: r.ph,
     temp: r.water_temperature
   }));
 
-  const latest = rows[rows.length - 1];
+  const latestRow = latestRes.data?.[0];
+  const seed = latestRow
+    ? {
+        ph: latestRow.ph,
+        temp: latestRow.water_temperature,
+        updatedAt: new Date(latestRow.recorded_at).toISOString(),
+        ageMs: now - new Date(latestRow.recorded_at).getTime()
+      }
+    : null;
+
+  // Nedsampling for perioder længere end et døgn: bucket readings i tid og
+  // plot medianen af hver bucket, så vi rammer højst ~MAX_POINTS punkter.
+  const points =
+    RANGES[range].ms > RANGES['1d'].ms ? downsample(rows, MAX_POINTS) : rows;
 
   return (
     <main style={{ padding: 24, maxWidth: 760, margin: '0 auto' }}>
@@ -40,21 +76,15 @@ export default async function Page() {
         HOVEDTANK
       </h1>
 
-      {!latest ? (
-        <p style={{ opacity: 0.6 }}>Ingen målinger endnu.</p>
+      <LiveReading initial={seed} />
+
+      <RangeButtons active={range} />
+
+      {rows.length === 0 ? (
+        <p style={{ opacity: 0.6 }}>Ingen målinger i den valgte periode.</p>
       ) : (
         <>
-          <LiveReading
-            initial={{
-              ph: latest.ph,
-              temp: latest.temp,
-              updatedAt: new Date(latest.t).toISOString(),
-              ageMs: now - latest.t
-            }}
-          />
-
-          <Chart rows={rows} now={now} />
-
+          <ChartZoom points={points} windowStart={windowStart} windowEnd={now} />
           <Stats rows={rows} />
         </>
       )}
@@ -62,174 +92,34 @@ export default async function Page() {
   );
 }
 
-function Chart({ rows, now }) {
-  const w = 760, h = 280;
-  const padL = 38, padR = 44, padT = 12, padB = 28;
-  const t0 = now - 24 * 3600 * 1000;
-
-  // --- pH-akse (venstre) ---
-  const values = rows.map(r => r.ph);
-  let lo = Math.min(...values, TARGET_LO) - 0.15;
-  let hi = Math.max(...values, TARGET_HI) + 0.15;
-  if (hi - lo < 1) {
-    const mid = (hi + lo) / 2;
-    lo = mid - 0.5;
-    hi = mid + 0.5;
-  }
-
-  // --- Temperaturakse (højre), uafhængig skala tilpasset data ---
-  const temps = rows.filter(r => r.temp != null).map(r => r.temp);
-  const hasTemp = temps.length > 0;
-  let tLo = 0, tHi = 1;
-  if (hasTemp) {
-    tLo = Math.min(...temps);
-    tHi = Math.max(...temps);
-    let span = tHi - tLo;
-    if (span < 0.5) {            // næsten flad kurve — giv den lidt luft
-      const mid = (tHi + tLo) / 2;
-      tLo = mid - 0.25;
-      tHi = mid + 0.25;
-      span = tHi - tLo;
-    }
-    const pad = span * 0.1;
-    tLo -= pad;
-    tHi += pad;
-  }
-
-  const x = t => padL + ((t - t0) / (now - t0)) * (w - padL - padR);
-  const y = v => padT + (1 - (v - lo) / (hi - lo)) * (h - padT - padB);
-  const yT = v => padT + (1 - (v - tLo) / (tHi - tLo)) * (h - padT - padB);
-
-  const step = hi - lo < 2.5 ? 0.25 : 0.5;
-  const yTicks = [];
-  for (let v = Math.ceil(lo / step) * step; v <= hi; v += step) {
-    yTicks.push(Number(v.toFixed(2)));
-  }
-
-  const tTicks = [];
-  if (hasTemp) {
-    const tStep = niceStep(tHi - tLo);
-    for (let v = Math.ceil(tLo / tStep) * tStep; v <= tHi + 1e-9; v += tStep) {
-      tTicks.push(Number(v.toFixed(2)));
-    }
-  }
-
-  const xTicks = [0, 1, 2, 3, 4].map(i => t0 + (i / 4) * (now - t0));
-
-  const points = rows
-    .filter(r => r.t >= t0)
-    .map(r => `${x(r.t).toFixed(1)},${y(r.ph).toFixed(1)}`)
-    .join(' ');
-
-  // Temperaturkurven brydes i segmenter hen over huller (manglende værdier),
-  // så linjen ikke trækkes ned til nul.
-  const tempSegments = [];
-  let seg = [];
-  for (const r of rows) {
-    if (r.t < t0) continue;
-    if (r.temp == null) {
-      if (seg.length) { tempSegments.push(seg); seg = []; }
-    } else {
-      seg.push([x(r.t), yT(r.temp)]);
-    }
-  }
-  if (seg.length) tempSegments.push(seg);
-
-  const legendItem = { display: 'flex', alignItems: 'center', gap: 6, opacity: 0.7 };
-  const swatch = c => ({ width: 14, height: 2, background: c, display: 'inline-block' });
+function RangeButtons({ active }) {
+  const base = {
+    display: 'inline-block',
+    padding: '6px 12px',
+    borderRadius: 6,
+    border: '1px solid #2a2e37',
+    fontSize: 13,
+    lineHeight: 1.2,
+    textDecoration: 'none',
+    color: '#e8eaed'
+  };
+  const selected = {
+    ...base,
+    background: '#4ade80',
+    borderColor: '#4ade80',
+    color: '#0f1115',
+    fontWeight: 600
+  };
 
   return (
-    <div>
-      <div style={{ display: 'flex', gap: 18, marginBottom: 8, fontSize: 12 }}>
-        <span style={legendItem}>
-          <span style={swatch('#4ade80')} /> pH
-        </span>
-        {hasTemp && (
-          <span style={legendItem}>
-            <span style={swatch('#f59e0b')} /> Vandtemperatur
-          </span>
-        )}
-      </div>
-
-      <svg viewBox={`0 0 ${w} ${h}`} style={{ width: '100%', height: 'auto', overflow: 'visible' }}>
-        <rect
-          x={padL}
-          y={y(TARGET_HI)}
-          width={w - padL - padR}
-          height={y(TARGET_LO) - y(TARGET_HI)}
-          fill="#4ade80"
-          opacity="0.10"
-        />
-
-        {yTicks.map(v => (
-          <g key={`ph-${v}`}>
-            <line x1={padL} y1={y(v)} x2={w - padR} y2={y(v)}
-                  stroke="#e8eaed" strokeWidth="1" opacity="0.08" />
-            <text x={padL - 8} y={y(v)} textAnchor="end" dominantBaseline="middle"
-                  fill="#4ade80" opacity="0.7" fontSize="11">
-              {v.toFixed(1)}
-            </text>
-          </g>
-        ))}
-
-        {tTicks.map(v => (
-          <g key={`t-${v}`}>
-            <line x1={w - padR} y1={yT(v)} x2={w - padR + 4} y2={yT(v)}
-                  stroke="#f59e0b" strokeWidth="1" opacity="0.5" />
-            <text x={w - padR + 8} y={yT(v)} textAnchor="start" dominantBaseline="middle"
-                  fill="#f59e0b" opacity="0.75" fontSize="11">
-              {v.toFixed(1)}
-            </text>
-          </g>
-        ))}
-
-        {xTicks.map((t, i) => (
-          <g key={`x-${i}`}>
-            <line x1={x(t)} y1={padT} x2={x(t)} y2={h - padB}
-                  stroke="#e8eaed" strokeWidth="1" opacity="0.06" />
-            <text x={x(t)} y={h - padB + 16}
-                  textAnchor={i === 0 ? 'start' : i === 4 ? 'end' : 'middle'}
-                  fill="#e8eaed" opacity="0.45" fontSize="11">
-              {fmtClock(t)}
-            </text>
-          </g>
-        ))}
-
-        {tempSegments.map((s, i) => (
-          s.length >= 2 ? (
-            <polyline key={`ts-${i}`}
-                      points={s.map(p => `${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(' ')}
-                      fill="none" stroke="#f59e0b" strokeWidth="2"
-                      strokeLinejoin="round" strokeLinecap="round" opacity="0.9" />
-          ) : (
-            <circle key={`ts-${i}`} cx={s[0][0]} cy={s[0][1]} r="3" fill="#f59e0b" />
-          )
-        ))}
-
-        {rows.length >= 2 && (
-          <polyline points={points} fill="none" stroke="#4ade80"
-                    strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
-        )}
-
-        {rows.length === 1 && (
-          <circle cx={x(rows[0].t)} cy={y(rows[0].ph)} r="4" fill="#4ade80" />
-        )}
-      </svg>
+    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', margin: '4px 0 16px' }}>
+      {Object.entries(RANGES).map(([key, { label }]) => (
+        <a key={key} href={`/?range=${key}`} style={key === active ? selected : base}>
+          {label}
+        </a>
+      ))}
     </div>
   );
-}
-
-// Pænt aksespring (1/2/5 × 10ⁿ) så temperaturaksen får ca. 4 mærker.
-function niceStep(range, target = 4) {
-  const raw = range / target;
-  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
-  const norm = raw / mag;
-  let s;
-  if (norm < 1.5) s = 1;
-  else if (norm < 3) s = 2;
-  else if (norm < 7) s = 5;
-  else s = 10;
-  return s * mag;
 }
 
 function Stats({ rows }) {
@@ -265,10 +155,45 @@ function Stats({ rows }) {
   );
 }
 
-function fmtClock(t) {
-  return new Date(t).toLocaleTimeString('da-DK', {
-    hour: '2-digit',
-    minute: '2-digit',
-    timeZone: TZ
-  });
+function median(sorted) {
+  const n = sorted.length;
+  const m = n >> 1;
+  return n % 2 ? sorted[m] : (sorted[m - 1] + sorted[m]) / 2;
+}
+
+// Bucket readings i tid og returnér medianen af hver bucket (pH, temp og
+// tidspunkt). Bruges kun til lange perioder for at holde punktantallet nede.
+function downsample(rows, targetMax) {
+  if (rows.length <= targetMax) return rows;
+
+  const first = rows[0].t;
+  const last = rows[rows.length - 1].t;
+  const span = last - first || 1;
+  const bucketMs = span / targetMax;
+
+  const buckets = new Map();
+  for (const r of rows) {
+    let idx = Math.floor((r.t - first) / bucketMs);
+    if (idx >= targetMax) idx = targetMax - 1;
+    let bucket = buckets.get(idx);
+    if (!bucket) {
+      bucket = [];
+      buckets.set(idx, bucket);
+    }
+    bucket.push(r);
+  }
+
+  const out = [];
+  for (const idx of [...buckets.keys()].sort((a, b) => a - b)) {
+    const bucket = buckets.get(idx);
+    const phs = bucket.map(r => r.ph).sort((a, b) => a - b);
+    const temps = bucket.map(r => r.temp).filter(v => v != null).sort((a, b) => a - b);
+    const ts = bucket.map(r => r.t).sort((a, b) => a - b);
+    out.push({
+      t: median(ts),
+      ph: median(phs),
+      temp: temps.length ? median(temps) : null
+    });
+  }
+  return out;
 }
