@@ -1,0 +1,15 @@
+[Unit]
+Description=pH-doser (lokal MQTT-styring af pH-down)
+After=mosquitto.service
+
+[Service]
+Type=simple
+User=mbierfreund
+WorkingDirectory=/home/mbierfreund/farm-dashboard/bridge
+EnvironmentFile=/home/mbierfreund/farm-dashboard/bridge/.env.doser
+ExecStart=/home/mbierfreund/bridge-venv/bin/python /home/mbierfreund/farm-dashboard/bridge/ph_doser.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
