@@ -16,10 +16,18 @@ Opret ~/farm-dashboard/bridge/.env med:
     INTERVAL_SECONDS=300
     LIVE_URL=https://farm-dashboard.vercel.app/api/live
     LIVE_INTERVAL_SECONDS=15
+    DOSE_URL=https://farm-dashboard.vercel.app/api/dose
+    ML_PER_DOSE=2.0
+    DOSE_SECONDS=5.0
 
 `LIVE_URL` er live-visningen paa dashboardet; udelades den, springes
 live-opdateringerne over. `LIVE_INTERVAL_SECONDS` (standard 15) er den
 korteste tid mellem to live-POST'er.
+
+`DOSE_URL` logger doseringer i databasen: naar der kommer en besked paa
+`farm/dose/ph_down`, sendes `ML_PER_DOSE` (standard 2.0) ml og `DOSE_SECONDS`
+(standard 5.0) sekunder til endpointet. Udelades `DOSE_URL`, springes
+doseringsloggen over.
 
 Laas filen ned og start tjenesten:
 

@@ -9,13 +9,17 @@ const TARGET_HI = 6.3;
 const OPT_LO = 6.0;
 const OPT_HI = 6.2;
 const BAND = '#4ade80';
+// Doseringssøjler i violet — tydeligt adskilt fra den grønne og gule kurve.
+const DOSE = '#a78bfa';
+// Andel af plothøjden nederst, der er reserveret til doseringssøjler.
+const DOSE_BAND = 0.15;
 
 const W = 760, H = 280;
 const PADL = 38, PADR = 44, PADT = 12, PADB = 28;
 
 // Interaktiv indpakning: håndterer træk-for-at-zoome og genbruger ChartBody
 // til selve tegningen, så der kun findes én implementering af graf-koden.
-export default function ChartZoom({ points, windowStart, windowEnd }) {
+export default function ChartZoom({ points, doses = [], bucketMs, windowStart, windowEnd }) {
   const svgRef = useRef(null);
   const [zoom, setZoom] = useState(null); // { start, end } i ms, eller null
   const [drag, setDrag] = useState(null); // { x0, x1 } i bruger-koordinater (0..W)
@@ -81,6 +85,21 @@ export default function ChartZoom({ points, windowStart, windowEnd }) {
   const visible = points.filter(p => p.t >= view0 && p.t <= view1);
   const hasTemp = visible.some(p => p.temp != null);
 
+  // Bucket doseringerne på det samme gitter som målingernes nedsampling:
+  // hele vinduet delt i nB buckets, forankret til vinduets start, så de ikke
+  // flytter sig ved zoom. Højden pr. søjle er de samlede ml i bucketen.
+  const bMs = bucketMs || (windowEnd - windowStart) / 400;
+  const nB = Math.max(1, Math.round((windowEnd - windowStart) / bMs));
+  const bucketMl = new Map();
+  for (const d of doses) {
+    let idx = Math.floor((d.t - windowStart) / bMs);
+    if (idx < 0) idx = 0;
+    if (idx >= nB) idx = nB - 1;
+    bucketMl.set(idx, (bucketMl.get(idx) || 0) + d.ml);
+  }
+  const maxMl = bucketMl.size ? Math.max(...bucketMl.values()) : 0;
+  const hasDoses = bucketMl.size > 0;
+
   const legendItem = { display: 'flex', alignItems: 'center', gap: 6, opacity: 0.7 };
   const swatch = c => ({ width: 14, height: 2, background: c, display: 'inline-block' });
   const bandSwatch = alpha => ({
@@ -116,6 +135,11 @@ export default function ChartZoom({ points, windowStart, windowEnd }) {
         <span style={legendItem}>
           <span style={bandSwatch(0.4)} /> Optimalt 6,0–6,2
         </span>
+        {hasDoses && (
+          <span style={legendItem}>
+            <span style={{ width: 10, height: 12, background: DOSE, borderRadius: 1, display: 'inline-block' }} /> Dosering (ml)
+          </span>
+        )}
         {zoom && (
           <button
             onClick={() => setZoom(null)}
@@ -155,7 +179,17 @@ export default function ChartZoom({ points, windowStart, windowEnd }) {
           setHover(null);
         }}
       >
-        <ChartBody points={visible} view0={view0} view1={view1} hover={drag ? null : hover} />
+        <ChartBody
+          points={visible}
+          view0={view0}
+          view1={view1}
+          hover={drag ? null : hover}
+          bucketMl={bucketMl}
+          maxMl={maxMl}
+          bucketMs={bMs}
+          windowStart={windowStart}
+          nB={nB}
+        />
         {selW > 0 && (
           <rect x={selX} y={PADT} width={selW} height={H - PADT - PADB} fill="#e8eaed" opacity="0.12" />
         )}
@@ -166,8 +200,16 @@ export default function ChartZoom({ points, windowStart, windowEnd }) {
 
 // Ren tegnefunktion: akser, målbånd, gitter og de to kurver for et givet
 // tidsvindue. Skalaerne tilpasses de synlige punkter, så zoom også omregner Y.
-function ChartBody({ points, view0, view1, hover }) {
+function ChartBody({ points, view0, view1, hover, bucketMl, maxMl, bucketMs, windowStart, nB }) {
   const span = view1 - view0;
+
+  // Reservér en stribe nederst til doseringssøjler, så pH- og temperaturkurven
+  // beholder deres egen plads ovenfor og ikke mases sammen med søjlerne.
+  const fullH = H - PADT - PADB;
+  const hasDoses = bucketMl && bucketMl.size > 0;
+  const doseBandH = hasDoses ? fullH * DOSE_BAND : 0;
+  const doseGap = hasDoses ? 6 : 0;
+  const lineBottom = H - PADB - doseBandH - doseGap;
 
   // pH-akse (venstre) — inkludér altid målbåndet og lidt luft om data.
   const phv = points.map(p => p.ph);
@@ -199,8 +241,8 @@ function ChartBody({ points, view0, view1, hover }) {
   }
 
   const x = t => PADL + ((t - view0) / (view1 - view0)) * (W - PADL - PADR);
-  const y = v => PADT + (1 - (v - lo) / (hi - lo)) * (H - PADT - PADB);
-  const yT = v => PADT + (1 - (v - tLo) / (tHi - tLo)) * (H - PADT - PADB);
+  const y = v => PADT + (1 - (v - lo) / (hi - lo)) * (lineBottom - PADT);
+  const yT = v => PADT + (1 - (v - tLo) / (tHi - tLo)) * (lineBottom - PADT);
 
   const step = hi - lo < 2.5 ? 0.25 : 0.5;
   const yTicks = [];
@@ -255,6 +297,16 @@ function ChartBody({ points, view0, view1, hover }) {
     if (hover.temp != null) {
       lines.push({ text: `${hover.temp.toFixed(1)} °C`, fill: '#f59e0b', opacity: 1 });
     }
+    // Doseringer i den bucket guiden står over.
+    if (hasDoses) {
+      let hidx = Math.floor((hover.t - windowStart) / bucketMs);
+      if (hidx < 0) hidx = 0;
+      if (hidx >= nB) hidx = nB - 1;
+      const hMl = bucketMl.get(hidx);
+      if (hMl) {
+        lines.push({ text: `Dosis ${hMl.toFixed(1).replace('.', ',')} ml`, fill: DOSE, opacity: 1 });
+      }
+    }
 
     const boxW = Math.max(...lines.map(l => l.text.length)) * 6.6 + 16;
     const boxH = lines.length * 15 + 8;
@@ -274,6 +326,37 @@ function ChartBody({ points, view0, view1, hover }) {
             {l.text}
           </text>
         ))}
+      </g>
+    );
+  }
+
+  // Doseringssøjler langs bunden, med egen ml-skala i doseringsstriben.
+  const baseline = H - PADB;
+  const bandTop = lineBottom + doseGap;
+  let doseEls = null;
+  if (hasDoses) {
+    const bars = [];
+    for (const [idx, ml] of bucketMl) {
+      const tc = windowStart + (idx + 0.5) * bucketMs;
+      if (tc < view0 || tc > view1) continue;
+      const cx = x(tc);
+      const wPx = x(tc + bucketMs / 2) - x(tc - bucketMs / 2);
+      const barW = Math.max(1.5, Math.min(wPx * 0.7, 10));
+      const barH = maxMl > 0 ? (ml / maxMl) * doseBandH : 0;
+      bars.push(
+        <rect key={`d-${idx}`} x={cx - barW / 2} y={baseline - barH} width={barW} height={barH} fill={DOSE} opacity="0.85" />
+      );
+    }
+    doseEls = (
+      <g>
+        <line x1={PADL} y1={baseline} x2={W - PADR} y2={baseline} stroke="#e8eaed" strokeWidth="1" opacity="0.08" />
+        <text x={PADL - 8} y={bandTop} textAnchor="end" dominantBaseline="middle" fill={DOSE} opacity="0.8" fontSize="10">
+          {maxMl.toFixed(1).replace('.', ',')} ml
+        </text>
+        <text x={PADL - 8} y={baseline} textAnchor="end" dominantBaseline="middle" fill={DOSE} opacity="0.6" fontSize="10">
+          0
+        </text>
+        {bars}
       </g>
     );
   }
@@ -357,6 +440,7 @@ function ChartBody({ points, view0, view1, hover }) {
         <circle cx={x(points[0].t)} cy={y(points[0].ph)} r="4" fill="#4ade80" />
       )}
 
+      {doseEls}
       {hoverEls}
     </>
   );

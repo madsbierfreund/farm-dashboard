@@ -23,6 +23,12 @@ INTERVAL = int(os.environ.get("INTERVAL_SECONDS", "300"))
 LIVE_URL = os.environ.get("LIVE_URL")
 LIVE_INTERVAL = int(os.environ.get("LIVE_INTERVAL_SECONDS", "15"))
 
+# Doseringslog: naar doseren udloeser en dosis, logges den i databasen.
+DOSE_URL = os.environ.get("DOSE_URL")
+ML_PER_DOSE = float(os.environ.get("ML_PER_DOSE", "2.0"))
+DOSE_SECONDS = float(os.environ.get("DOSE_SECONDS", "5.0"))
+DOSE_TOPIC = "farm/dose/ph_down"
+
 TOPICS = {
     "farm/ph_node/sensor/ph/state": "ph",
     "farm/ph_node/sensor/ph_voltage/state": "ph_voltage",
@@ -44,9 +50,13 @@ def on_connect(client, userdata, flags, reason_code, properties=None):
     print("forbundet til broker", flush=True)
     for topic in TOPICS:
         client.subscribe(topic)
+    client.subscribe(DOSE_TOPIC)
 
 
 def on_message(client, userdata, msg):
+    if msg.topic == DOSE_TOPIC:
+        maybe_send_dose()
+        return
     field = TOPICS.get(msg.topic)
     if field is None:
         return
@@ -127,6 +137,36 @@ def maybe_send_live():
     threading.Thread(target=live_send, args=(snapshot,), daemon=True).start()
 
 
+def dose_send():
+    """Logger en dosering i databasen. Kaldes paa en worker-traad."""
+    payload = {"ml": ML_PER_DOSE, "seconds": DOSE_SECONDS, "kind": "ph_down"}
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        DOSE_URL,
+        data=data,
+        headers={
+            "content-type": "application/json",
+            "x-ingest-token": INGEST_TOKEN,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            print(f"dosering logget {payload} -> {resp.status}", flush=True)
+    except urllib.error.HTTPError as err:
+        print(f"dose http-fejl {err.code}: {err.read().decode()[:200]}", flush=True)
+    except Exception as err:
+        print(f"dose netvaerksfejl: {err}", flush=True)
+
+
+def maybe_send_dose():
+    """Logger en dosering off-callback, saa et langsomt eller fejlende POST
+    aldrig blokerer MQTT-callbacket."""
+    if not DOSE_URL:
+        return
+    threading.Thread(target=dose_send, daemon=True).start()
+
+
 def flush_loop():
     while True:
         time.sleep(INTERVAL)
@@ -149,6 +189,8 @@ def flush_loop():
 def main():
     if not LIVE_URL:
         print("LIVE_URL ikke sat - live-visning deaktiveret", flush=True)
+    if not DOSE_URL:
+        print("DOSE_URL ikke sat - doseringslog deaktiveret", flush=True)
 
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     client.username_pw_set(USER, PASSWORD)

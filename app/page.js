@@ -31,8 +31,9 @@ export default async function Page({ searchParams }) {
   const since = new Date(windowStart).toISOString();
 
   // Vinduet til grafen/statistikken + den nyeste måling til live-tallet
-  // (uafhængigt af det valgte vindue, så tallet altid er korrekt).
-  const [windowRes, latestRes] = await Promise.all([
+  // (uafhængigt af det valgte vindue, så tallet altid er korrekt) + doseringer
+  // i samme vindue som målingerne.
+  const [windowRes, latestRes, doseRes] = await Promise.all([
     db
       .from('ph_readings')
       .select('recorded_at, ph, water_temperature')
@@ -42,7 +43,12 @@ export default async function Page({ searchParams }) {
       .from('ph_readings')
       .select('recorded_at, ph, water_temperature')
       .order('recorded_at', { ascending: false })
-      .limit(1)
+      .limit(1),
+    db
+      .from('dose_events')
+      .select('dosed_at, ml')
+      .gte('dosed_at', since)
+      .order('dosed_at', { ascending: true })
   ]);
 
   if (windowRes.error) {
@@ -54,6 +60,16 @@ export default async function Page({ searchParams }) {
     ph: r.ph,
     temp: r.water_temperature
   }));
+
+  const doses = (doseRes.data ?? []).map(d => ({
+    t: new Date(d.dosed_at).getTime(),
+    ml: d.ml
+  }));
+  const totalMl = doses.reduce((sum, d) => sum + d.ml, 0);
+
+  // Samme tidsbuckets som målingerne bruges til nedsampling: hele vinduet delt
+  // i MAX_POINTS buckets. Doseringerne bucketes på det samme gitter.
+  const bucketMs = RANGES[range].ms / MAX_POINTS;
 
   const latestRow = latestRes.data?.[0];
   const seed = latestRow
@@ -84,8 +100,14 @@ export default async function Page({ searchParams }) {
         <p style={{ opacity: 0.6 }}>Ingen målinger i den valgte periode.</p>
       ) : (
         <>
-          <ChartZoom points={points} windowStart={windowStart} windowEnd={now} />
-          <Stats rows={rows} />
+          <ChartZoom
+            points={points}
+            doses={doses}
+            bucketMs={bucketMs}
+            windowStart={windowStart}
+            windowEnd={now}
+          />
+          <Stats rows={rows} totalMl={totalMl} />
         </>
       )}
     </main>
@@ -122,7 +144,7 @@ function RangeButtons({ active }) {
   );
 }
 
-function Stats({ rows }) {
+function Stats({ rows, totalMl }) {
   if (rows.length === 0) return null;
   const v = rows.map(r => r.ph);
   const min = Math.min(...v);
@@ -150,6 +172,10 @@ function Stats({ rows }) {
       <div style={cell}>
         <div style={label}>MÅLINGER</div>
         <div style={value}>{rows.length}</div>
+      </div>
+      <div style={cell}>
+        <div style={label}>DOSERET</div>
+        <div style={value}>{totalMl.toFixed(1).replace('.', ',')} ml</div>
       </div>
     </div>
   );
