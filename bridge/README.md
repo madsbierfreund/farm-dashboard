@@ -19,6 +19,8 @@ Opret ~/farm-dashboard/bridge/.env med:
     DOSE_URL=https://farm-dashboard.vercel.app/api/dose
     ML_PER_DOSE=2.0
     DOSE_SECONDS=5.0
+    SETTINGS_URL=https://farm-dashboard.vercel.app/api/settings
+    SETTINGS_POLL_SECONDS=60
 
 `LIVE_URL` er live-visningen paa dashboardet; udelades den, springes
 live-opdateringerne over. `LIVE_INTERVAL_SECONDS` (standard 15) er den
@@ -28,6 +30,12 @@ korteste tid mellem to live-POST'er.
 `farm/dose/ph_down`, sendes `ML_PER_DOSE` (standard 2.0) ml og `DOSE_SECONDS`
 (standard 5.0) sekunder til endpointet. Udelades `DOSE_URL`, springes
 doseringsloggen over.
+
+`SETTINGS_URL` henter doseringsindstillingerne fra web-panelet hvert
+`SETTINGS_POLL_SECONDS` (standard 60) og relayer dem til MQTT-emnet
+`farm/dose/settings` (retained), men kun naar de faktisk aendrede sig. Saadan
+naar aendringer fra webben ud til doseren, uden at doseren nogensinde selv
+afhaenger af internettet. Udelades `SETTINGS_URL`, springes relayet over.
 
 Laas filen ned og start tjenesten:
 
@@ -64,9 +72,19 @@ Opret `~/farm-dashboard/bridge/.env.doser` med:
     SANITY_MAX=9.0
 
 Alle variabler har fornuftige standardvaerdier, saa kun MQTT-oplysningerne er
-strengt noedvendige. Tilstanden (seneste dosistidspunkt og dagens taeller)
-gemmes i `~/.ph_doser_state.json`, saa en genstart hverken nulstiller
-nedkoelingen eller det daglige loft.
+strengt noedvendige. Tilstanden (seneste dosistidspunkt, dagens taeller og de
+sidst modtagne indstillinger) gemmes i `~/.ph_doser_state.json`, saa en
+genstart hverken nulstiller nedkoelingen, det daglige loft eller falder
+tilbage til env-vaerdierne.
+
+**Indstillingerne aendres normalt fra web-panelet** ("Doseringsindstillinger"
+under grafen). De felter — `enabled`, `dose_above` (doser over), `target_ph`
+(maal), `cooldown_minutes` (nedkoeling), `max_doses_per_day` og
+`consecutive_readings` (maalinger i traek) — relayes fra webben via
+`farm/dose/settings` og overskriver env-vaerdierne i drift. Doseren validerer
+dem paa ny og beholder de forrige, hvis noget er ugyldigt. `.env.doser` er
+altsaa kun fallback ved foerste opstart (og hvis en modtaget besked er
+ugyldig); de aktive vaerdier kan altid ses i `farm/dose/status`.
 
 Laas filen ned og start tjenesten:
 

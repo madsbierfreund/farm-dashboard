@@ -29,11 +29,29 @@ ML_PER_DOSE = float(os.environ.get("ML_PER_DOSE", "2.0"))
 DOSE_SECONDS = float(os.environ.get("DOSE_SECONDS", "5.0"))
 DOSE_TOPIC = "farm/dose/ph_down"
 
+# Indstillinger fra web-panelet relayes til doseren via MQTT (retained), saa
+# doseren aldrig afhaenger af internettet ved runtime.
+SETTINGS_URL = os.environ.get("SETTINGS_URL")
+SETTINGS_POLL = int(os.environ.get("SETTINGS_POLL_SECONDS", "60"))
+SETTINGS_TOPIC = "farm/dose/settings"
+# Kun vaerdifelterne relayes (ikke updated_at), saa vi kun publicerer, naar de
+# faktiske vaerdier aendrede sig — ikke ved hvert gem med samme vaerdier.
+SETTINGS_FIELDS = (
+    "enabled",
+    "dose_above",
+    "target_ph",
+    "cooldown_minutes",
+    "max_doses_per_day",
+    "consecutive_readings",
+)
+
 TOPICS = {
     "farm/ph_node/sensor/ph/state": "ph",
     "farm/ph_node/sensor/ph_voltage/state": "ph_voltage",
     "farm/ph_node/sensor/water_temperature/state": "water_temperature",
 }
+
+client = None  # saettes i main(); bruges af settings_poll_loop til at publicere.
 
 lock = threading.Lock()
 buffer = {"ph": [], "ph_voltage": [], "water_temperature": []}
@@ -167,6 +185,40 @@ def maybe_send_dose():
     threading.Thread(target=dose_send, daemon=True).start()
 
 
+def fetch_settings():
+    """Henter doseringsindstillingerne fra web-appen. Returnerer et dict med
+    kun de relevante felter, eller None ved fejl/manglende raekke."""
+    req = urllib.request.Request(SETTINGS_URL, headers={"accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception as err:
+        print(f"kunne ikke hente indstillinger: {err}", flush=True)
+        return None
+    if not isinstance(data, dict):
+        return None
+    return {k: data[k] for k in SETTINGS_FIELDS if k in data}
+
+
+def settings_poll_loop():
+    """Poller web-appen og relayer aendringer til MQTT (retained). Publicerer
+    kun naar vaerdierne faktisk aendrede sig, saa journalen ikke fyldes op."""
+    last = None
+    time.sleep(2)  # lad MQTT-forbindelsen naa at komme op foerst
+    while True:
+        settings = fetch_settings()
+        if settings is not None:
+            payload = json.dumps(settings, sort_keys=True)
+            if payload != last:
+                info = client.publish(SETTINGS_TOPIC, payload, qos=1, retain=True)
+                if info.rc == mqtt.MQTT_ERR_SUCCESS:
+                    last = payload
+                    print(f"indstillinger relayet -> {SETTINGS_TOPIC}: {payload}", flush=True)
+                else:
+                    print(f"kunne ikke publicere indstillinger (rc={info.rc})", flush=True)
+        time.sleep(SETTINGS_POLL)
+
+
 def flush_loop():
     while True:
         time.sleep(INTERVAL)
@@ -187,10 +239,14 @@ def flush_loop():
 
 
 def main():
+    global client
+
     if not LIVE_URL:
         print("LIVE_URL ikke sat - live-visning deaktiveret", flush=True)
     if not DOSE_URL:
         print("DOSE_URL ikke sat - doseringslog deaktiveret", flush=True)
+    if not SETTINGS_URL:
+        print("SETTINGS_URL ikke sat - relay af indstillinger deaktiveret", flush=True)
 
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     client.username_pw_set(USER, PASSWORD)
@@ -198,6 +254,8 @@ def main():
     client.on_message = on_message
 
     threading.Thread(target=flush_loop, daemon=True).start()
+    if SETTINGS_URL:
+        threading.Thread(target=settings_poll_loop, daemon=True).start()
 
     client.connect(BROKER, PORT, keepalive=60)
     client.loop_forever()

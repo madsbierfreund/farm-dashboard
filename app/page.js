@@ -1,6 +1,7 @@
 import { createClient } from '@supabase/supabase-js';
 import LiveReading from './LiveReading';
 import ChartZoom from './ChartZoom';
+import SettingsPanel from './SettingsPanel';
 
 export const dynamic = 'force-dynamic';
 
@@ -33,7 +34,7 @@ export default async function Page({ searchParams }) {
   // Vinduet til grafen/statistikken + den nyeste måling til live-tallet
   // (uafhængigt af det valgte vindue, så tallet altid er korrekt) + doseringer
   // i samme vindue som målingerne.
-  const [windowRes, latestRes, doseRes] = await Promise.all([
+  const [windowRes, latestRes, doseRes, settingsRes] = await Promise.all([
     db
       .from('ph_readings')
       .select('recorded_at, ph, water_temperature')
@@ -48,7 +49,14 @@ export default async function Page({ searchParams }) {
       .from('dose_events')
       .select('dosed_at, ml')
       .gte('dosed_at', since)
-      .order('dosed_at', { ascending: true })
+      .order('dosed_at', { ascending: true }),
+    db
+      .from('doser_settings')
+      .select(
+        'id, enabled, dose_above, target_ph, cooldown_minutes, max_doses_per_day, consecutive_readings, updated_at'
+      )
+      .eq('id', 1)
+      .maybeSingle()
   ]);
 
   if (windowRes.error) {
@@ -110,6 +118,8 @@ export default async function Page({ searchParams }) {
           <Stats rows={rows} totalMl={totalMl} />
         </>
       )}
+
+      <SettingsPanel initial={settingsRes.data ?? null} />
     </main>
   );
 }
