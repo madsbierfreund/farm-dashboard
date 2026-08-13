@@ -2,6 +2,7 @@ import { createClient } from '@supabase/supabase-js';
 import LiveReading from './LiveReading';
 import ChartZoom from './ChartZoom';
 import SettingsPanel from './SettingsPanel';
+import BottleGauge from './BottleGauge';
 
 export const dynamic = 'force-dynamic';
 
@@ -35,28 +36,30 @@ export default async function Page({ searchParams }) {
   // Bucketing sker i databasen (RPC), så vi ikke rammer Supabases 1000-rækkers
   // loft — en direkte select ville tavst afkorte lange vinduer. Statistikken
   // beregnes også i databasen over hele vinduet, ikke kun de plottede punkter.
-  const [bucketRes, statsRes, latestRes, doseRes, settingsRes] = await Promise.all([
-    db.rpc('readings_bucketed', { from_ts, to_ts, buckets: MAX_POINTS }),
-    db.rpc('readings_stats', { from_ts, to_ts }),
-    db
-      .from('ph_readings')
-      .select('recorded_at, ph, water_temperature')
-      .order('recorded_at', { ascending: false })
-      .limit(1),
-    db
-      .from('dose_events')
-      .select('dosed_at, ml')
-      .gte('dosed_at', from_ts)
-      .order('dosed_at', { ascending: true })
-      .limit(2000),
-    db
-      .from('doser_settings')
-      .select(
-        'id, enabled, dose_above, target_ph, cooldown_minutes, max_doses_per_day, consecutive_readings, updated_at'
-      )
-      .eq('id', 1)
-      .maybeSingle()
-  ]);
+  const [bucketRes, statsRes, latestRes, doseRes, settingsRes, refillRes] =
+    await Promise.all([
+      db.rpc('readings_bucketed', { from_ts, to_ts, buckets: MAX_POINTS }),
+      db.rpc('readings_stats', { from_ts, to_ts }),
+      db
+        .from('ph_readings')
+        .select('recorded_at, ph, water_temperature')
+        .order('recorded_at', { ascending: false })
+        .limit(1),
+      db
+        .from('dose_events')
+        .select('dosed_at, ml')
+        .gte('dosed_at', from_ts)
+        .order('dosed_at', { ascending: true })
+        .limit(2000),
+      db
+        .from('doser_settings')
+        .select(
+          'id, enabled, dose_above, target_ph, cooldown_minutes, max_doses_per_day, consecutive_readings, updated_at'
+        )
+        .eq('id', 1)
+        .maybeSingle(),
+      db.rpc('dose_remaining', { p_kind: 'ph_down' })
+    ]);
 
   if (bucketRes.error) {
     return <main style={{ padding: 24 }}>Fejl: {bucketRes.error.message}</main>;
@@ -123,6 +126,8 @@ export default async function Page({ searchParams }) {
           <Stats stats={stats} totalMl={totalMl} />
         </>
       )}
+
+      <BottleGauge initial={refillRes.data?.[0] ?? null} now={now} />
 
       <SettingsPanel initial={settingsRes.data ?? null} />
     </main>
