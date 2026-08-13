@@ -29,17 +29,15 @@ export default async function Page({ searchParams }) {
 
   const now = Date.now();
   const windowStart = now - RANGES[range].ms;
-  const since = new Date(windowStart).toISOString();
+  const from_ts = new Date(windowStart).toISOString();
+  const to_ts = new Date(now).toISOString();
 
-  // Vinduet til grafen/statistikken + den nyeste måling til live-tallet
-  // (uafhængigt af det valgte vindue, så tallet altid er korrekt) + doseringer
-  // i samme vindue som målingerne.
-  const [windowRes, latestRes, doseRes, settingsRes] = await Promise.all([
-    db
-      .from('ph_readings')
-      .select('recorded_at, ph, water_temperature')
-      .gte('recorded_at', since)
-      .order('recorded_at', { ascending: true }),
+  // Bucketing sker i databasen (RPC), så vi ikke rammer Supabases 1000-rækkers
+  // loft — en direkte select ville tavst afkorte lange vinduer. Statistikken
+  // beregnes også i databasen over hele vinduet, ikke kun de plottede punkter.
+  const [bucketRes, statsRes, latestRes, doseRes, settingsRes] = await Promise.all([
+    db.rpc('readings_bucketed', { from_ts, to_ts, buckets: MAX_POINTS }),
+    db.rpc('readings_stats', { from_ts, to_ts }),
     db
       .from('ph_readings')
       .select('recorded_at, ph, water_temperature')
@@ -48,8 +46,9 @@ export default async function Page({ searchParams }) {
     db
       .from('dose_events')
       .select('dosed_at, ml')
-      .gte('dosed_at', since)
-      .order('dosed_at', { ascending: true }),
+      .gte('dosed_at', from_ts)
+      .order('dosed_at', { ascending: true })
+      .limit(2000),
     db
       .from('doser_settings')
       .select(
@@ -59,15 +58,26 @@ export default async function Page({ searchParams }) {
       .maybeSingle()
   ]);
 
-  if (windowRes.error) {
-    return <main style={{ padding: 24 }}>Fejl: {windowRes.error.message}</main>;
+  if (bucketRes.error) {
+    return <main style={{ padding: 24 }}>Fejl: {bucketRes.error.message}</main>;
   }
 
-  const rows = (windowRes.data ?? []).map(r => ({
-    t: new Date(r.recorded_at).getTime(),
+  // bucket_at → tidsstempel, ph / water_temperature → de to serier. Buckets
+  // uden temperatur giver temp=null, hvilket fortsat bryder den gule linje i
+  // segmenter i ChartBody.
+  const points = (bucketRes.data ?? []).map(r => ({
+    t: new Date(r.bucket_at).getTime(),
     ph: r.ph,
     temp: r.water_temperature
   }));
+
+  const statsRow = statsRes.data?.[0];
+  const stats = {
+    min: statsRow?.min_ph,
+    avg: statsRow?.avg_ph,
+    max: statsRow?.max_ph,
+    count: Number(statsRow?.n ?? 0)
+  };
 
   const doses = (doseRes.data ?? []).map(d => ({
     t: new Date(d.dosed_at).getTime(),
@@ -75,8 +85,8 @@ export default async function Page({ searchParams }) {
   }));
   const totalMl = doses.reduce((sum, d) => sum + d.ml, 0);
 
-  // Samme tidsbuckets som målingerne bruges til nedsampling: hele vinduet delt
-  // i MAX_POINTS buckets. Doseringerne bucketes på det samme gitter.
+  // Doseringerne bucketes på samme gitter som RPC'ens buckets: hele vinduet
+  // delt i MAX_POINTS buckets.
   const bucketMs = RANGES[range].ms / MAX_POINTS;
 
   const latestRow = latestRes.data?.[0];
@@ -89,11 +99,6 @@ export default async function Page({ searchParams }) {
       }
     : null;
 
-  // Nedsampling for perioder længere end et døgn: bucket readings i tid og
-  // plot medianen af hver bucket, så vi rammer højst ~MAX_POINTS punkter.
-  const points =
-    RANGES[range].ms > RANGES['1d'].ms ? downsample(rows, MAX_POINTS) : rows;
-
   return (
     <main style={{ padding: 24, maxWidth: 760, margin: '0 auto' }}>
       <h1 style={{ fontSize: 15, opacity: 0.6, fontWeight: 500, letterSpacing: 0.3 }}>
@@ -104,7 +109,7 @@ export default async function Page({ searchParams }) {
 
       <RangeButtons active={range} />
 
-      {rows.length === 0 ? (
+      {points.length === 0 ? (
         <p style={{ opacity: 0.6 }}>Ingen målinger i den valgte periode.</p>
       ) : (
         <>
@@ -115,7 +120,7 @@ export default async function Page({ searchParams }) {
             windowStart={windowStart}
             windowEnd={now}
           />
-          <Stats rows={rows} totalMl={totalMl} />
+          <Stats stats={stats} totalMl={totalMl} />
         </>
       )}
 
@@ -154,12 +159,8 @@ function RangeButtons({ active }) {
   );
 }
 
-function Stats({ rows, totalMl }) {
-  if (rows.length === 0) return null;
-  const v = rows.map(r => r.ph);
-  const min = Math.min(...v);
-  const max = Math.max(...v);
-  const avg = v.reduce((a, b) => a + b, 0) / v.length;
+function Stats({ stats, totalMl }) {
+  const { min, avg, max, count } = stats;
 
   const cell = { flex: 1 };
   const label = { fontSize: 11, opacity: 0.45, letterSpacing: 0.3 };
@@ -169,19 +170,19 @@ function Stats({ rows, totalMl }) {
     <div style={{ display: 'flex', gap: 24, marginTop: 24 }}>
       <div style={cell}>
         <div style={label}>MIN</div>
-        <div style={value}>{min.toFixed(2)}</div>
+        <div style={value}>{Number(min).toFixed(2)}</div>
       </div>
       <div style={cell}>
         <div style={label}>GNS.</div>
-        <div style={value}>{avg.toFixed(2)}</div>
+        <div style={value}>{Number(avg).toFixed(2)}</div>
       </div>
       <div style={cell}>
         <div style={label}>MAKS</div>
-        <div style={value}>{max.toFixed(2)}</div>
+        <div style={value}>{Number(max).toFixed(2)}</div>
       </div>
       <div style={cell}>
         <div style={label}>MÅLINGER</div>
-        <div style={value}>{rows.length}</div>
+        <div style={value}>{count}</div>
       </div>
       <div style={cell}>
         <div style={label}>DOSERET</div>
@@ -189,47 +190,4 @@ function Stats({ rows, totalMl }) {
       </div>
     </div>
   );
-}
-
-function median(sorted) {
-  const n = sorted.length;
-  const m = n >> 1;
-  return n % 2 ? sorted[m] : (sorted[m - 1] + sorted[m]) / 2;
-}
-
-// Bucket readings i tid og returnér medianen af hver bucket (pH, temp og
-// tidspunkt). Bruges kun til lange perioder for at holde punktantallet nede.
-function downsample(rows, targetMax) {
-  if (rows.length <= targetMax) return rows;
-
-  const first = rows[0].t;
-  const last = rows[rows.length - 1].t;
-  const span = last - first || 1;
-  const bucketMs = span / targetMax;
-
-  const buckets = new Map();
-  for (const r of rows) {
-    let idx = Math.floor((r.t - first) / bucketMs);
-    if (idx >= targetMax) idx = targetMax - 1;
-    let bucket = buckets.get(idx);
-    if (!bucket) {
-      bucket = [];
-      buckets.set(idx, bucket);
-    }
-    bucket.push(r);
-  }
-
-  const out = [];
-  for (const idx of [...buckets.keys()].sort((a, b) => a - b)) {
-    const bucket = buckets.get(idx);
-    const phs = bucket.map(r => r.ph).sort((a, b) => a - b);
-    const temps = bucket.map(r => r.temp).filter(v => v != null).sort((a, b) => a - b);
-    const ts = bucket.map(r => r.t).sort((a, b) => a - b);
-    out.push({
-      t: median(ts),
-      ph: median(phs),
-      temp: temps.length ? median(temps) : null
-    });
-  }
-  return out;
 }
