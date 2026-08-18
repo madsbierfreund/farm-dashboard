@@ -3,12 +3,17 @@
 import { useRef, useState } from 'react';
 
 const TZ = 'Europe/Copenhagen';
-// Acceptabelt pH-interval, og det optimale "sweet spot" indeni til tomater.
-const TARGET_LO = 5.8;
-const TARGET_HI = 6.3;
-const OPT_LO = 6.0;
-const OPT_HI = 6.2;
+// Acceptabelt pH-interval, og det optimale "sweet spot" indeni (centreret om
+// idealet 5,8). Bemærk: alle labels udledes af disse konstanter, så teksten
+// aldrig kan drive ud af sync med båndene.
+const TARGET_LO = 5.5;
+const TARGET_HI = 6.2;
+const OPT_LO = 5.7;
+const OPT_HI = 5.9;
 const BAND = '#4ade80';
+
+// Formatér et pH-tal med dansk decimalkomma til labels.
+const phLabel = v => v.toLocaleString('da-DK', { minimumFractionDigits: 1 });
 // Doseringssøjler i violet — tydeligt adskilt fra den grønne og gule kurve.
 const DOSE = '#a78bfa';
 // Andel af plothøjden nederst, der er reserveret til doseringssøjler.
@@ -130,10 +135,10 @@ export default function ChartZoom({ points, doses = [], bucketMs, windowStart, w
           </span>
         )}
         <span style={legendItem}>
-          <span style={bandSwatch(0.18)} /> Acceptabelt 5,8–6,3
+          <span style={bandSwatch(0.18)} /> Acceptabelt {phLabel(TARGET_LO)}–{phLabel(TARGET_HI)}
         </span>
         <span style={legendItem}>
-          <span style={bandSwatch(0.4)} /> Optimalt 6,0–6,2
+          <span style={bandSwatch(0.4)} /> Optimalt {phLabel(OPT_LO)}–{phLabel(OPT_HI)}
         </span>
         {hasDoses && (
           <span style={legendItem}>
