@@ -42,7 +42,7 @@ export default async function Page({ searchParams }) {
       db.rpc('readings_stats', { from_ts, to_ts }),
       db
         .from('ph_readings')
-        .select('recorded_at, ph, water_temperature')
+        .select('recorded_at, ph, water_temperature, ec')
         .order('recorded_at', { ascending: false })
         .limit(1),
       db
@@ -65,13 +65,14 @@ export default async function Page({ searchParams }) {
     return <main style={{ padding: 24 }}>Fejl: {bucketRes.error.message}</main>;
   }
 
-  // bucket_at → tidsstempel, ph / water_temperature → de to serier. Buckets
-  // uden temperatur giver temp=null, hvilket fortsat bryder den gule linje i
-  // segmenter i ChartBody.
+  // bucket_at → tidsstempel, ph / water_temperature / ec → de tre serier.
+  // Buckets uden temperatur eller EC giver temp/ec=null, hvilket fortsat bryder
+  // de respektive linjer i segmenter i ChartBody.
   const points = (bucketRes.data ?? []).map(r => ({
     t: new Date(r.bucket_at).getTime(),
     ph: r.ph,
-    temp: r.water_temperature
+    temp: r.water_temperature,
+    ec: r.ec
   }));
 
   const statsRow = statsRes.data?.[0];
@@ -97,6 +98,7 @@ export default async function Page({ searchParams }) {
     ? {
         ph: latestRow.ph,
         temp: latestRow.water_temperature,
+        ec: latestRow.ec,
         updatedAt: new Date(latestRow.recorded_at).toISOString(),
         ageMs: now - new Date(latestRow.recorded_at).getTime()
       }

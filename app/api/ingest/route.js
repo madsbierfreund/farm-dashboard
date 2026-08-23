@@ -45,10 +45,20 @@ export async function POST(req) {
     return Number.isFinite(n) ? n : null;
   };
 
+  // ec er valgfri, men afvis tal uden for 0-30 mS/cm i stedet for at gemme vrøvl.
+  let ec = null;
+  if (body.ec != null) {
+    ec = Number(body.ec);
+    if (!Number.isFinite(ec) || ec < 0 || ec > 30) {
+      return new Response('ec out of range', { status: 400 });
+    }
+  }
+
   const { error } = await db().from('ph_readings').insert({
     ph,
     ph_voltage: num(body.ph_voltage),
     water_temperature: num(body.water_temperature),
+    ec,
     source: 'farm-ph-node'
   });
 

@@ -49,14 +49,15 @@ TOPICS = {
     "farm/ph_node/sensor/ph/state": "ph",
     "farm/ph_node/sensor/ph_voltage/state": "ph_voltage",
     "farm/ph_node/sensor/water_temperature/state": "water_temperature",
+    "farm/ph_node/sensor/ec/state": "ec",
 }
 
 client = None  # saettes i main(); bruges af settings_poll_loop til at publicere.
 
 lock = threading.Lock()
-buffer = {"ph": [], "ph_voltage": [], "water_temperature": []}
+buffer = {"ph": [], "ph_voltage": [], "water_temperature": [], "ec": []}
 # Seneste kendte vaerdi pr. felt til live-visningen (ikke median).
-latest = {"ph": None, "ph_voltage": None, "water_temperature": None}
+latest = {"ph": None, "ph_voltage": None, "water_temperature": None, "ec": None}
 # Monotont tidsstempel for sidste live-POST, saa vi kan begraense frekvensen.
 live_marker = {"last": 0.0}
 
@@ -114,7 +115,7 @@ def live_send(snapshot):
     if snapshot["ph"] is None:
         return
     payload = {"ph": round(snapshot["ph"], 3)}
-    for field in ("ph_voltage", "water_temperature"):
+    for field in ("ph_voltage", "water_temperature", "ec"):
         if snapshot[field] is not None:
             payload[field] = round(snapshot[field], 4)
 
@@ -232,7 +233,7 @@ def flush_loop():
             continue
 
         payload = {"ph": round(statistics.median(snapshot["ph"]), 3)}
-        for field in ("ph_voltage", "water_temperature"):
+        for field in ("ph_voltage", "water_temperature", "ec"):
             if snapshot[field]:
                 payload[field] = round(statistics.median(snapshot[field]), 4)
         send(payload)

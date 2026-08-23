@@ -43,6 +43,7 @@ export default function LiveReading({ initial }) {
         setReading({
           ph: row.ph,
           temp: row.water_temperature,
+          ec: row.ec,
           updatedAt: row.updated_at
         });
       } catch {
@@ -78,6 +79,11 @@ export default function LiveReading({ initial }) {
         {reading.temp != null && (
           <span style={{ fontSize: 24, opacity: 0.55 }}>
             {reading.temp.toFixed(1)} °C
+          </span>
+        )}
+        {reading.ec != null && (
+          <span style={{ fontSize: 24, opacity: 0.55 }}>
+            {reading.ec.toFixed(2)} mS/cm
           </span>
         )}
       </div>

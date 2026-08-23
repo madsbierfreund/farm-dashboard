@@ -13,7 +13,7 @@ function db() {
 export async function GET() {
   const { data, error } = await db()
     .from('live_state')
-    .select('ph, ph_voltage, water_temperature, updated_at')
+    .select('ph, ph_voltage, water_temperature, ec, updated_at')
     .eq('id', 1)
     .maybeSingle();
 
@@ -45,11 +45,21 @@ export async function POST(req) {
     return Number.isFinite(n) ? n : null;
   };
 
+  // ec er valgfri, men afvis tal uden for 0-30 mS/cm i stedet for at gemme vrøvl.
+  let ec = null;
+  if (body.ec != null) {
+    ec = Number(body.ec);
+    if (!Number.isFinite(ec) || ec < 0 || ec > 30) {
+      return new Response('ec out of range', { status: 400 });
+    }
+  }
+
   const { error } = await db().from('live_state').upsert({
     id: 1,
     ph,
     ph_voltage: num(body.ph_voltage),
     water_temperature: num(body.water_temperature),
+    ec,
     updated_at: new Date().toISOString()
   });
 
