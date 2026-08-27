@@ -20,6 +20,8 @@ PH_TOPIC = "farm/ph_node/sensor/ph/state"
 TEMP_TOPIC = "farm/ph_node/sensor/water_temperature/state"
 STATUS_TOPIC = "farm/dose/status"
 SETTINGS_TOPIC = "farm/dose/settings"
+# Noedstop: en tom besked her faar Homey til at slukke pumpen med det samme.
+STOP_TOPIC = "farm/dose/ph_down_stop"
 
 
 def env_str(name, default):
@@ -65,6 +67,16 @@ SANITY_MIN = env_float("SANITY_MIN", 4.0)
 SANITY_MAX = env_float("SANITY_MAX", 9.0)
 STATE_FILE = os.path.expanduser(env_str("STATE_FILE", "~/.ph_doser_state.json"))
 
+# --- Noedstop / laas (to uafhaengige sikkerhedsforanstaltninger) ---
+# Falder pH under gulvet, stoppes pumpen og en laasefil skrives. Mens laasefilen
+# findes, doseres der aldrig. Laasen ryddes kun ved at slette filen manuelt.
+PH_EMERGENCY_FLOOR = env_float("PH_EMERGENCY_FLOOR", 5.0)
+PH_EMERGENCY_LATCH_FILE = os.path.expanduser(
+    env_str("PH_EMERGENCY_LATCH_FILE", "/var/lib/ph-doser/emergency.lock")
+)
+EMERGENCY_STOP_INTERVAL = 10.0  # sekunder mellem gentagne noedstop-publiceringer
+LATCH_LOG_INTERVAL = 60.0       # sekunder mellem gentagne laase-advarsler
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -81,6 +93,9 @@ consecutive = 0          # antal maalinger over dose_above i traek
 last_dose_time = 0.0     # epoch for seneste dosering (bevares over genstart)
 dose_count = 0           # doser siden lokal midnat
 dose_day = ""            # den lokale dato dose_count gaelder for
+# Rate-limit markoerer for de to sikkerhedsforanstaltninger.
+emergency_marker = {"last_stop": 0.0}  # sidste noedstop-publicering (epoch)
+latch_marker = {"last_log": 0.0}       # sidste laase-advarsel (epoch)
 
 # De aktive indstillinger. Env-vaerdierne er kun fallback ved opstart, foer en
 # retained MQTT-besked ankommer (og hvis en modtaget besked er ugyldig). Den
@@ -224,13 +239,77 @@ def roll_day(now):
         save_state()
 
 
+# === Sikkerhed 1: pH-gulv (noedstop) og Sikkerhed 2: laas ===
+
+def latch_exists():
+    return os.path.exists(PH_EMERGENCY_LATCH_FILE)
+
+
+def read_latch():
+    """Laeser laasefilens indhold (tidsstempel + pH) til status. None hvis ingen."""
+    try:
+        with open(PH_EMERGENCY_LATCH_FILE) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        # Filen findes, men kunne ikke laeses/parses — meld stadig som laast.
+        return {"at": None, "ph": None}
+
+
+def write_latch(value, now):
+    """Skriver laasefilen med et ISO-tidsstempel og pH-vaerdien."""
+    data = {"at": datetime.fromtimestamp(now).isoformat(timespec="seconds"), "ph": value}
+    try:
+        parent = os.path.dirname(PH_EMERGENCY_LATCH_FILE)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(PH_EMERGENCY_LATCH_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as err:
+        log.error("kunne ikke skrive laasefil %s: %s", PH_EMERGENCY_LATCH_FILE, err)
+
+
+def emergency_stop(value, now):
+    """Sikkerhed 1 — pH-gulv. Ved pH under gulvet: stop pumpen (tom besked til
+    STOP_TOPIC), skriv laasefilen og log en ERROR. Laasefilen skrives ved
+    foerste udloesning (bevarer det foerste tidspunkt); selve stop-publiceringen
+    gentages hoejst én gang pr. EMERGENCY_STOP_INTERVAL sekunder."""
+    if not latch_exists():
+        write_latch(value, now)
+    if now - emergency_marker["last_stop"] < EMERGENCY_STOP_INTERVAL:
+        return
+    emergency_marker["last_stop"] = now
+    try:
+        client.publish(STOP_TOPIC, payload=b"", qos=1)
+    except Exception as err:
+        log.error("kunne ikke sende noedstop paa %s: %s", STOP_TOPIC, err)
+    log.error(
+        "NOEDSTOP: pH %.2f under gulv %.2f — stop sendt, laasefil %s",
+        value, PH_EMERGENCY_FLOOR, PH_EMERGENCY_LATCH_FILE,
+    )
+
+
+def warn_latched(now):
+    """Sikkerhed 2 — laas. Logger, at doseringen er blokeret, hoejst én gang pr.
+    LATCH_LOG_INTERVAL sekunder."""
+    if now - latch_marker["last_log"] < LATCH_LOG_INTERVAL:
+        return
+    latch_marker["last_log"] = now
+    log.warning(
+        "noedstop-laas aktiv (%s findes) — dosering blokeret, indtil filen slettes manuelt",
+        PH_EMERGENCY_LATCH_FILE,
+    )
+
+
 def publish_status(dose_fired):
     """Send en samlet status til farm/dose/status efter hver beslutning.
 
-    Statusbeskeden inkluderer de aktive indstillinger, saa det altid er
-    synligt, hvad doseren faktisk koerer med."""
+    Statusbeskeden inkluderer de aktive indstillinger og laasetilstanden, saa
+    det altid er synligt, hvad doseren faktisk koerer med."""
     cooldown_seconds = settings["cooldown_minutes"] * 60.0
     cooldown_left = max(0.0, cooldown_seconds - (time.time() - last_dose_time))
+    latched = latch_exists()
     status = {
         "ph": round(last_ph, 3) if last_ph is not None else None,
         "water_temperature": round(last_temp, 2) if last_temp is not None else None,
@@ -241,6 +320,9 @@ def publish_status(dose_fired):
         "dose_fired": dose_fired,
         "enabled": settings["enabled"],
         "settings": dict(settings),
+        "emergency_floor": PH_EMERGENCY_FLOOR,
+        "latched": latched,
+        "latch": read_latch() if latched else None,
     }
     try:
         client.publish(STATUS_TOPIC, json.dumps(status), qos=0, retain=True)
@@ -279,6 +361,21 @@ def on_ph(value):
     last_ph = value
     last_ph_time = now
     roll_day(now)
+
+    # === SIKKERHEDSFORANSTALTNINGER ===
+    # Disse koerer paa HVER maaling, foer enhver doseringsbeslutning, og kan
+    # ikke springes over af en early-return laengere nede.
+    #
+    # Sikkerhed 1 — pH-gulv. Bevidst UDEN for sanitetstjekket: en reel, farligt
+    # lav pH (som pumpen der koerte til 1,79) ligger ogsaa under SANITY_MIN og
+    # ville ellers blive fejlfortolket som "probe ude af vand" og ignoreret.
+    if value < PH_EMERGENCY_FLOOR:
+        emergency_stop(value, now)
+
+    # Sikkerhed 2 — laas. Mens laasefilen findes, doseres der ALDRIG, uanset pH.
+    latched = latch_exists()
+    if latched:
+        warn_latched(now)
 
     # Aktive indstillinger (kan aendres i drift via farm/dose/settings).
     enabled = settings["enabled"]
@@ -320,7 +417,10 @@ def on_ph(value):
     cooldown_left = max(0.0, cooldown_seconds - (now - last_dose_time))
     dose_fired = False
 
-    if not enabled:
+    if latched:
+        # Noedstop-laasen blokerer al dosering (advarsel logget ovenfor).
+        reason = "noedstop-laas aktiv — doserer ikke"
+    elif not enabled:
         reason = "dosering deaktiveret (enabled=false)"
     elif age > STALE_SECONDS:
         reason = f"data foraeldet ({age:.0f}s > {STALE_SECONDS:.0f}s)"
@@ -392,6 +492,12 @@ def main():
         log.warning(
             "ADVARSEL: target_ph (%.2f) er hoejere end dose_above (%.2f) — "
             "tjek konfigurationen", settings["target_ph"], settings["dose_above"],
+        )
+    log.info("noedstop-gulv pH %.2f, laasefil %s", PH_EMERGENCY_FLOOR, PH_EMERGENCY_LATCH_FILE)
+    if latch_exists():
+        log.warning(
+            "noedstop-laas allerede aktiv ved opstart (%s) — dosering blokeret, "
+            "indtil filen slettes manuelt", PH_EMERGENCY_LATCH_FILE,
         )
 
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)

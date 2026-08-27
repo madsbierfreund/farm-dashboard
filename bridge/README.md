@@ -70,6 +70,8 @@ Opret `~/farm-dashboard/bridge/.env.doser` med:
     STALE_SECONDS=120
     SANITY_MIN=4.0
     SANITY_MAX=9.0
+    PH_EMERGENCY_FLOOR=5.0
+    PH_EMERGENCY_LATCH_FILE=/var/lib/ph-doser/emergency.lock
 
 Alle variabler har fornuftige standardvaerdier, saa kun MQTT-oplysningerne er
 strengt noedvendige. Tilstanden (seneste dosistidspunkt, dagens taeller og de
@@ -112,3 +114,30 @@ i `.env.doser` og genstart. Styringen bliver koerende og fortsaetter med at
 sende status, men doserer ikke:
 
     sudo systemctl restart ph-doser
+
+## Noedstop og laas (to uafhaengige sikkerhedsforanstaltninger)
+
+Pumpen styres via et Homey-flow, der taender og slukker en Philips Hue-kontakt.
+Hue-broen kan selv taende kontakten uden for vores kontrol — det skete én gang,
+og pumpen koerte i tolv timer og trak tankens pH ned til 1,79. To uafhaengige
+sikkerhedsforanstaltninger beskytter mod det:
+
+1. **pH-gulv.** Falder pH under `PH_EMERGENCY_FLOOR` (standard 5,0) paa en
+   maaling, sender doseren straks en tom besked til `farm/dose/ph_down_stop`
+   (som Homey bruger til at slukke pumpen), skriver en laasefil og logger en
+   ERROR. Stop-beskeden gentages, saa laenge pH er under gulvet, hoejst én gang
+   pr. 10 sekunder. Tjekket koerer bevidst UDEN for sanitetstjekket, saa en
+   reel, farligt lav pH ikke fejlagtigt ignoreres som "probe ude af vand".
+
+2. **Laas.** Saa laenge laasefilen (`PH_EMERGENCY_LATCH_FILE`, standard
+   `/var/lib/ph-doser/emergency.lock`) findes, doserer styringen **aldrig**,
+   uanset pH. Den logger blokeringen som WARNING hoejst én gang pr. minut.
+   Laasetilstanden vises ogsaa i `farm/dose/status` (`latched` og `latch`).
+
+Laasen ryddes **kun** ved at slette filen manuelt — det er et bevidst valg, saa
+en operatoer skal tjekke tanken, foer doseringen genoptages:
+
+    sudo rm /var/lib/ph-doser/emergency.lock
+
+Mappen `/var/lib/ph-doser` oprettes automatisk (ejet af tjenestens bruger) via
+`StateDirectory=ph-doser` i unit-filen, saa den kan skrive laasefilen.

@@ -10,6 +10,8 @@ EnvironmentFile=/home/mbierfreund/farm-dashboard/bridge/.env.doser
 ExecStart=/home/mbierfreund/bridge-venv/bin/python /home/mbierfreund/farm-dashboard/bridge/ph_doser.py
 Restart=always
 RestartSec=10
+# Opretter /var/lib/ph-doser (ejet af User) til noedstop-laasefilen.
+StateDirectory=ph-doser
 
 [Install]
 WantedBy=multi-user.target
