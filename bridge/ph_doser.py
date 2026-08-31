@@ -22,6 +22,8 @@ STATUS_TOPIC = "farm/dose/status"
 SETTINGS_TOPIC = "farm/dose/settings"
 # Noedstop: en tom besked her faar Homey til at slukke pumpen med det samme.
 STOP_TOPIC = "farm/dose/ph_down_stop"
+# Homey publicerer kontaktens faktiske tilstand ("on"/"off") her.
+STATE_TOPIC = "farm/state/ph_down"
 
 
 def env_str(name, default):
@@ -77,6 +79,15 @@ PH_EMERGENCY_LATCH_FILE = os.path.expanduser(
 EMERGENCY_STOP_INTERVAL = 10.0  # sekunder mellem gentagne noedstop-publiceringer
 LATCH_LOG_INTERVAL = 60.0       # sekunder mellem gentagne laase-advarsler
 
+# --- Tilstands-watchdog: fanger UAUTORISEREDE taend af Hue-kontakten ---
+# Hue-broen kan taende pumpen uden for vores kontrol. Homey publicerer den
+# faktiske kontakt-tilstand til STATE_TOPIC. Et "on", der ikke falder taet paa
+# vores egen doseringskommando, stoppes straks — uafhaengigt af pH.
+DOSE_WINDOW_S = env_float("DOSE_WINDOW_S", 8.0)                 # "on" inden for dette efter en dosis er vores
+UNAUTHORIZED_MAX_STOPS = env_int("UNAUTHORIZED_MAX_STOPS", 10)  # laas efter saa mange forgaeves stop i traek
+STATE_STALE_S = env_float("STATE_STALE_S", 900)                 # ingen tilstand i saa lang tid → blind
+WATCHDOG_STOP_INTERVAL = 1.0                                    # hoejst ét watchdog-stop pr. sekund
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -96,6 +107,15 @@ dose_day = ""            # den lokale dato dose_count gaelder for
 # Rate-limit markoerer for de to sikkerhedsforanstaltninger.
 emergency_marker = {"last_stop": 0.0}  # sidste noedstop-publicering (epoch)
 latch_marker = {"last_log": 0.0}       # sidste laase-advarsel (epoch)
+
+# --- Tilstands-watchdog ---
+last_dose_command = 0.0   # epoch for seneste publish til DOSE_TOPIC (ikke persisteret)
+switch_state = None       # sidst kendte kontakt-tilstand ("on"/"off")
+switch_state_time = 0.0   # epoch for sidste tilstandsbesked
+watchdog_started = 0.0    # epoch for opstart (basislinje for staleness)
+unauthorized_stops = 0    # forgaeves stop i traek uden et "off"
+watchdog_marker = {"last_stop": 0.0}     # rate-limit for watchdog-stop (epoch)
+state_stale_marker = {"last_warn": 0.0}  # rate-limit for blind-advarsel (epoch)
 
 # De aktive indstillinger. Env-vaerdierne er kun fallback ved opstart, foer en
 # retained MQTT-besked ankommer (og hvis en modtaget besked er ugyldig). Den
@@ -254,12 +274,16 @@ def read_latch():
         return None
     except Exception:
         # Filen findes, men kunne ikke laeses/parses — meld stadig som laast.
-        return {"at": None, "ph": None}
+        return {"at": None, "reason": None, "ph": None}
 
 
-def write_latch(value, now):
-    """Skriver laasefilen med et ISO-tidsstempel og pH-vaerdien."""
-    data = {"at": datetime.fromtimestamp(now).isoformat(timespec="seconds"), "ph": value}
+def write_latch(now, reason, ph=None):
+    """Skriver laasefilen med et ISO-tidsstempel, en aarsag og evt. pH-vaerdi."""
+    data = {
+        "at": datetime.fromtimestamp(now).isoformat(timespec="seconds"),
+        "reason": reason,
+        "ph": ph,
+    }
     try:
         parent = os.path.dirname(PH_EMERGENCY_LATCH_FILE)
         if parent:
@@ -270,20 +294,25 @@ def write_latch(value, now):
         log.error("kunne ikke skrive laasefil %s: %s", PH_EMERGENCY_LATCH_FILE, err)
 
 
+def publish_stop():
+    """Publicér en tom besked til STOP_TOPIC, saa Homey slukker pumpen."""
+    try:
+        client.publish(STOP_TOPIC, payload=b"", qos=1)
+    except Exception as err:
+        log.error("kunne ikke sende stop paa %s: %s", STOP_TOPIC, err)
+
+
 def emergency_stop(value, now):
     """Sikkerhed 1 — pH-gulv. Ved pH under gulvet: stop pumpen (tom besked til
     STOP_TOPIC), skriv laasefilen og log en ERROR. Laasefilen skrives ved
     foerste udloesning (bevarer det foerste tidspunkt); selve stop-publiceringen
     gentages hoejst én gang pr. EMERGENCY_STOP_INTERVAL sekunder."""
     if not latch_exists():
-        write_latch(value, now)
+        write_latch(now, "ph_floor", value)
     if now - emergency_marker["last_stop"] < EMERGENCY_STOP_INTERVAL:
         return
     emergency_marker["last_stop"] = now
-    try:
-        client.publish(STOP_TOPIC, payload=b"", qos=1)
-    except Exception as err:
-        log.error("kunne ikke sende noedstop paa %s: %s", STOP_TOPIC, err)
+    publish_stop()
     log.error(
         "NOEDSTOP: pH %.2f under gulv %.2f — stop sendt, laasefil %s",
         value, PH_EMERGENCY_FLOOR, PH_EMERGENCY_LATCH_FILE,
@@ -300,6 +329,95 @@ def warn_latched(now):
         "noedstop-laas aktiv (%s findes) — dosering blokeret, indtil filen slettes manuelt",
         PH_EMERGENCY_LATCH_FILE,
     )
+
+
+# === Tilstands-watchdog (uafhaengig af pH) ===
+
+def _iso(ts):
+    return datetime.fromtimestamp(ts).isoformat(timespec="seconds") if ts > 0 else None
+
+
+def _watchdog_baseline():
+    """Referencepunkt for staleness: sidste tilstandsbesked, ellers opstart."""
+    if switch_state_time > 0:
+        return switch_state_time
+    if watchdog_started > 0:
+        return watchdog_started
+    return None
+
+
+def watchdog_stale(now):
+    base = _watchdog_baseline()
+    return base is not None and (now - base) > STATE_STALE_S
+
+
+def check_state_stale(now):
+    """Advarer (rate-limitet) hvis der ikke er set en kontakt-tilstand laenge.
+    Laaser ALDRIG paa staleness alene — vi ved bare ikke, hvad kontakten laver."""
+    if not watchdog_stale(now):
+        return
+    if now - state_stale_marker["last_warn"] < STATE_STALE_S:
+        return
+    state_stale_marker["last_warn"] = now
+    log.warning(
+        "watchdog blind: ingen kontakt-tilstand paa %s i %.0fs (>%.0fs)",
+        STATE_TOPIC, now - _watchdog_baseline(), STATE_STALE_S,
+    )
+
+
+def _handle_switch_on(now):
+    """Behandl et "on": afgoer om vi selv udloeste det, og stop det ellers."""
+    global unauthorized_stops
+
+    since = now - last_dose_command
+    if last_dose_command > 0 and since <= DOSE_WINDOW_S:
+        return  # inden for doseringsvinduet — vores egen dosis, goer intet
+
+    # Uautoriseret taend. Stop straks, men hoejst ét stop pr. sekund.
+    if now - watchdog_marker["last_stop"] < WATCHDOG_STOP_INTERVAL:
+        return
+    watchdog_marker["last_stop"] = now
+    publish_stop()
+    unauthorized_stops += 1
+    since_txt = (
+        f"{since:.1f}s efter sidste kommanderede dosis"
+        if last_dose_command > 0
+        else "ingen kommanderet dosis i denne session"
+    )
+    log.error(
+        "UAUTORISERET taend paa %s: kontakt ON, %s — stop sendt (forsoeg %d/%d)",
+        STATE_TOPIC, since_txt, unauthorized_stops, UNAUTHORIZED_MAX_STOPS,
+    )
+    if unauthorized_stops == UNAUTHORIZED_MAX_STOPS:
+        if not latch_exists():
+            write_latch(now, "switch_unresponsive", last_ph)
+        log.critical(
+            "kontakt reagerer IKKE paa stop efter %d forsoeg — noedstop-laas sat; "
+            "fortsaetter med at sende stop", unauthorized_stops,
+        )
+
+
+def on_state(payload, now):
+    """Behandl en kontakt-tilstandsbesked ("on"/"off") fra Homey.
+
+    Et UAUTORISERET "on" (ikke taet paa vores egen doseringskommando) stoppes
+    straks — uafhaengigt af pH og af noedstop-laasen."""
+    global switch_state, switch_state_time, unauthorized_stops
+
+    state = payload.strip().lower()
+    switch_state = state
+    switch_state_time = now
+
+    if state == "off":
+        if unauthorized_stops:
+            log.info("kontakt slukket — nulstiller taeller for forgaeves stop (var %d)", unauthorized_stops)
+        unauthorized_stops = 0
+    elif state == "on":
+        _handle_switch_on(now)
+    else:
+        log.warning("ukendt kontakt-tilstand paa %s: %r", STATE_TOPIC, payload[:50])
+
+    publish_status(dose_fired=False)
 
 
 def publish_status(dose_fired):
@@ -323,6 +441,10 @@ def publish_status(dose_fired):
         "emergency_floor": PH_EMERGENCY_FLOOR,
         "latched": latched,
         "latch": read_latch() if latched else None,
+        "switch_state": switch_state,
+        "switch_state_at": _iso(switch_state_time),
+        "watchdog_stale": watchdog_stale(time.time()),
+        "unauthorized_stops": unauthorized_stops,
     }
     try:
         client.publish(STATUS_TOPIC, json.dumps(status), qos=0, retain=True)
@@ -336,7 +458,7 @@ def fire_dose(now):
     Taeller kun doseringen, hvis publiceringen faktisk lykkedes, saa en
     fejlet besked hverken blokerer eller springer en reel dosering over.
     """
-    global last_dose_time, dose_count
+    global last_dose_time, dose_count, last_dose_command
     try:
         info = client.publish(DOSE_TOPIC, payload=b"", qos=0)
         if info.rc != mqtt.MQTT_ERR_SUCCESS:
@@ -346,6 +468,9 @@ def fire_dose(now):
         log.warning("fejl ved doseringsbesked: %s — proever igen", err)
         return False
 
+    # Registrér tidspunktet for kommandoen, saa watchdog'en ved, at det "on",
+    # der straks foelger, er vores eget.
+    last_dose_command = now
     last_dose_time = now
     dose_count += 1
     save_state()
@@ -361,6 +486,10 @@ def on_ph(value):
     last_ph = value
     last_ph_time = now
     roll_day(now)
+
+    # Watchdog: advar (men laas aldrig) hvis vi ikke har hoert kontaktens
+    # tilstand laenge. Koeres her, fordi pH-maalinger kommer regelmaessigt.
+    check_state_stale(now)
 
     # === SIKKERHEDSFORANSTALTNINGER ===
     # Disse koerer paa HVER maaling, foer enhver doseringsbeslutning, og kan
@@ -452,6 +581,7 @@ def on_connect(client, userdata, flags, reason_code, properties=None):
     client.subscribe(PH_TOPIC)
     client.subscribe(TEMP_TOPIC)
     client.subscribe(SETTINGS_TOPIC)
+    client.subscribe(STATE_TOPIC)
 
 
 def on_disconnect(client, userdata, flags, reason_code, properties=None):
@@ -470,6 +600,8 @@ def on_message(client, userdata, msg):
         elif msg.topic == SETTINGS_TOPIC:
             # Malformet JSON fanges nedenfor; da beholdes de nuvaerende vaerdier.
             apply_settings(json.loads(msg.payload.decode()), "MQTT")
+        elif msg.topic == STATE_TOPIC:
+            on_state(msg.payload.decode(), time.time())
     except (ValueError, UnicodeDecodeError):
         log.warning("ugyldig payload paa %s: %r", msg.topic, msg.payload[:50])
     except Exception as err:
@@ -477,8 +609,9 @@ def on_message(client, userdata, msg):
 
 
 def main():
-    global client
+    global client, watchdog_started
 
+    watchdog_started = time.time()
     load_state()
     log.info(
         "pH-doser starter: enabled=%s, doser over %.2f, maal %.2f, "
@@ -494,6 +627,10 @@ def main():
             "tjek konfigurationen", settings["target_ph"], settings["dose_above"],
         )
     log.info("noedstop-gulv pH %.2f, laasefil %s", PH_EMERGENCY_FLOOR, PH_EMERGENCY_LATCH_FILE)
+    log.info(
+        "watchdog: dosisvindue %.1fs, laas efter %d forgaeves stop, blind efter %.0fs",
+        DOSE_WINDOW_S, UNAUTHORIZED_MAX_STOPS, STATE_STALE_S,
+    )
     if latch_exists():
         log.warning(
             "noedstop-laas allerede aktiv ved opstart (%s) — dosering blokeret, "

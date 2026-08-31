@@ -51,7 +51,7 @@ class FakeClient:
         return [t for (t, *_rest) in self.published]
 
 
-class DoserSafetyTests(unittest.TestCase):
+class DoserTestBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.latch = os.path.join(self.tmp, "emergency.lock")
@@ -80,10 +80,27 @@ class DoserSafetyTests(unittest.TestCase):
         d.last_temp = None
         d.emergency_marker["last_stop"] = 0.0
         d.latch_marker["last_log"] = 0.0
+
+        # Watchdog-konfiguration og -tilstand.
+        d.DOSE_WINDOW_S = 8.0
+        d.UNAUTHORIZED_MAX_STOPS = 10
+        d.STATE_STALE_S = 900
+        d.last_dose_command = 0.0
+        d.switch_state = None
+        d.switch_state_time = 0.0
+        d.watchdog_started = 0.0
+        d.unauthorized_stops = 0
+        d.watchdog_marker["last_stop"] = 0.0
+        d.state_stale_marker["last_warn"] = 0.0
+
         d.client = FakeClient()
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+class SafetyTests(DoserTestBase):
+    """Noedstop (pH-gulv) og laas."""
 
     def test_below_floor_triggers_stop_and_latch(self):
         d.on_ph(1.79)
@@ -133,6 +150,61 @@ class DoserSafetyTests(unittest.TestCase):
         self.assertNotIn(d.DOSE_TOPIC, d.client.topics())
         # Status udsendes stadig som normalt.
         self.assertIn(d.STATUS_TOPIC, d.client.topics())
+
+
+class WatchdogTests(DoserTestBase):
+    """Tilstands-watchdog: fanger uautoriserede taend af Hue-kontakten."""
+
+    def test_on_inside_dose_window_not_unauthorized(self):
+        d.last_dose_command = 100.0
+        d.on_state("on", 102.0)  # 2 s efter kommandoen — inden for vinduet
+
+        self.assertNotIn(d.STOP_TOPIC, d.client.topics())
+        self.assertEqual(d.unauthorized_stops, 0)
+
+    def test_on_outside_window_triggers_stop(self):
+        d.last_dose_command = 100.0
+        d.on_state("on", 200.0)  # 100 s efter — klart uden for vinduet
+
+        self.assertIn(d.STOP_TOPIC, d.client.topics())
+        self.assertEqual(d.unauthorized_stops, 1)
+
+    def test_repeated_on_rate_limited(self):
+        # Tre "on" taet paa hinanden → kun to stop pga. 1 s rate-limit.
+        d.on_state("on", 100.0)
+        d.on_state("on", 100.5)  # <1 s siden sidste stop → intet stop
+        d.on_state("on", 101.5)
+
+        stops = [t for t in d.client.topics() if t == d.STOP_TOPIC]
+        self.assertEqual(len(stops), 2)
+        self.assertEqual(d.unauthorized_stops, 2)
+
+    def test_latch_after_max_failed_stops(self):
+        d.UNAUTHORIZED_MAX_STOPS = 3
+        for t in (100.0, 101.0, 102.0):  # tre stop uden et "off"
+            d.on_state("on", t)
+
+        self.assertTrue(d.latch_exists())
+        self.assertGreaterEqual(d.unauthorized_stops, 3)
+        self.assertEqual(d.read_latch()["reason"], "switch_unresponsive")
+
+    def test_off_resets_counter(self):
+        d.on_state("on", 100.0)
+        d.on_state("on", 101.0)
+        self.assertEqual(d.unauthorized_stops, 2)
+
+        d.on_state("off", 102.0)
+        self.assertEqual(d.unauthorized_stops, 0)
+
+    def test_staleness_warns_but_no_latch(self):
+        d.switch_state_time = 1000.0
+        now = 1000.0 + d.STATE_STALE_S + 10
+
+        with self.assertLogs(d.log, level="WARNING") as cm:
+            d.check_state_stale(now)
+
+        self.assertTrue(any("blind" in line for line in cm.output))
+        self.assertFalse(d.latch_exists())
 
 
 if __name__ == "__main__":

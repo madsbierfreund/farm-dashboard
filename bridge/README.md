@@ -72,6 +72,9 @@ Opret `~/farm-dashboard/bridge/.env.doser` med:
     SANITY_MAX=9.0
     PH_EMERGENCY_FLOOR=5.0
     PH_EMERGENCY_LATCH_FILE=/var/lib/ph-doser/emergency.lock
+    DOSE_WINDOW_S=8.0
+    UNAUTHORIZED_MAX_STOPS=10
+    STATE_STALE_S=900
 
 Alle variabler har fornuftige standardvaerdier, saa kun MQTT-oplysningerne er
 strengt noedvendige. Tilstanden (seneste dosistidspunkt, dagens taeller og de
@@ -141,3 +144,33 @@ en operatoer skal tjekke tanken, foer doseringen genoptages:
 
 Mappen `/var/lib/ph-doser` oprettes automatisk (ejet af tjenestens bruger) via
 `StateDirectory=ph-doser` i unit-filen, saa den kan skrive laasefilen.
+
+## Tilstands-watchdog (uautoriseret taend)
+
+Pumpen er en Philips Hue-kontakt. Hue-broen kan taende den af sig selv, uden
+for vores kontrol — det skete, og pumpen koerte i tolv timer. To Homey-flows
+publicerer kontaktens faktiske tilstand ("on"/"off") til `farm/state/ph_down`,
+og doseren lytter med som en watchdog:
+
+- Kommer et **"on"** inden for `DOSE_WINDOW_S` (standard 8 s) af doserens egen
+  seneste kommando til `farm/dose/ph_down`, er det vores egen dosis — der sker
+  intet.
+- Ethvert andet "on" er **uautoriseret**: doseren sender straks et stop til
+  `farm/dose/ph_down_stop` og logger en ERROR med tiden siden sidste
+  kommanderede dosis. Dette er uafhaengigt af pH og virker ogsaa, mens
+  noedstop-laasen er sat.
+- Bliver kontakten ved med at melde "on", gentages stoppet — hoejst ét pr.
+  sekund. Efter `UNAUTHORIZED_MAX_STOPS` (standard 10) forgaeves stop uden et
+  "off" saettes noedstop-laasen, og der logges en CRITICAL: kontakten reagerer
+  ikke. Doseren bliver ved med at sende stop.
+- Et **"off"** nulstiller taelleren for forgaeves stop.
+- Er der ikke set en tilstand paa `farm/state/ph_down` i `STATE_STALE_S`
+  (standard 900 s), logges en WARNING om, at watchdog'en er blind. Der laases
+  **aldrig** paa staleness alene.
+
+Kontaktens sidst kendte tilstand, tidspunktet, om watchdog'en er blind, og
+antallet af forgaeves stop vises ogsaa i `farm/dose/status`.
+
+## Tests
+
+    python3 -m unittest bridge.test_ph_doser
