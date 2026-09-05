@@ -3,8 +3,9 @@
 
 Koerer paa samme Raspberry Pi som ph_bridge.py og taler KUN med den lokale
 MQTT-broker. Ingen internetadgang: mistet net maa aldrig stoppe styringen
-eller efterlade den midt i en dosering. En dosering er en enkelt tom besked
-til DOSE_TOPIC; et Homey-flow lytter og koerer pumpen i faste 5 sekunder.
+eller efterlade den midt i en dosering. En dosering publicerer varigheden i
+sekunder til DOSE_TOPIC (farm/pump/1/run), hvorpaa ESPHome-noden koerer pumpe 1
+(pH-down). Homey-flowsene er ikke laengere en del af doseringsvejen.
 """
 
 import json
@@ -20,10 +21,10 @@ PH_TOPIC = "farm/ph_node/sensor/ph/state"
 TEMP_TOPIC = "farm/ph_node/sensor/water_temperature/state"
 STATUS_TOPIC = "farm/dose/status"
 SETTINGS_TOPIC = "farm/dose/settings"
-# Noedstop: en tom besked her faar Homey til at slukke pumpen med det samme.
-STOP_TOPIC = "farm/dose/ph_down_stop"
-# Homey publicerer kontaktens faktiske tilstand ("on"/"off") her.
-STATE_TOPIC = "farm/state/ph_down"
+# Noedstop: en besked her faar noden til at stoppe ALLE pumper med det samme.
+STOP_TOPIC = "farm/pump/stop_all"
+# Noden publicerer pumpe 1's (pH-down) faktiske tilstand ("on"/"off") her.
+STATE_TOPIC = "farm/pump/1/state"
 
 
 def env_str(name, default):
@@ -57,7 +58,10 @@ MQTT_PORT = env_int("MQTT_PORT", 1883)
 MQTT_USER = env_str("MQTT_USER", "")
 MQTT_PASSWORD = env_str("MQTT_PASSWORD", "")
 
-DOSE_TOPIC = env_str("DOSE_TOPIC", "farm/dose/ph_down")
+# En dosis er nu en kørsel af pumpe 1 (pH-down) via noden: publicér varigheden
+# i sekunder til DOSE_TOPIC. DOSE_SECONDS er varigheden pr. dosis.
+DOSE_TOPIC = env_str("DOSE_TOPIC", "farm/pump/1/run")
+DOSE_SECONDS = env_float("DOSE_SECONDS", 5.0)
 ENABLED = env_bool("ENABLED", True)
 DOSE_ABOVE = env_float("DOSE_ABOVE", 6.3)
 TARGET_PH = env_float("TARGET_PH", 6.1)
@@ -79,10 +83,10 @@ PH_EMERGENCY_LATCH_FILE = os.path.expanduser(
 EMERGENCY_STOP_INTERVAL = 10.0  # sekunder mellem gentagne noedstop-publiceringer
 LATCH_LOG_INTERVAL = 60.0       # sekunder mellem gentagne laase-advarsler
 
-# --- Tilstands-watchdog: fanger UAUTORISEREDE taend af Hue-kontakten ---
-# Hue-broen kan taende pumpen uden for vores kontrol. Homey publicerer den
-# faktiske kontakt-tilstand til STATE_TOPIC. Et "on", der ikke falder taet paa
-# vores egen doseringskommando, stoppes straks — uafhaengigt af pH.
+# --- Tilstands-watchdog: fanger UAUTORISEREDE taend af pumpen ---
+# Noden publicerer pumpe 1's faktiske tilstand til STATE_TOPIC. Et "on", der
+# ikke falder taet paa vores egen doseringskommando, stoppes straks —
+# uafhaengigt af pH.
 DOSE_WINDOW_S = env_float("DOSE_WINDOW_S", 8.0)                 # "on" inden for dette efter en dosis er vores
 UNAUTHORIZED_MAX_STOPS = env_int("UNAUTHORIZED_MAX_STOPS", 10)  # laas efter saa mange forgaeves stop i traek
 STATE_STALE_S = env_float("STATE_STALE_S", 900)                 # ingen tilstand i saa lang tid → blind
@@ -295,7 +299,7 @@ def write_latch(now, reason, ph=None):
 
 
 def publish_stop():
-    """Publicér en tom besked til STOP_TOPIC, saa Homey slukker pumpen."""
+    """Publicér en tom besked til STOP_TOPIC, saa noden stopper alle pumper."""
     try:
         client.publish(STOP_TOPIC, payload=b"", qos=1)
     except Exception as err:
@@ -398,7 +402,7 @@ def _handle_switch_on(now):
 
 
 def on_state(payload, now):
-    """Behandl en kontakt-tilstandsbesked ("on"/"off") fra Homey.
+    """Behandl en pumpe-tilstandsbesked ("on"/"off") fra noden.
 
     Et UAUTORISERET "on" (ikke taet paa vores egen doseringskommando) stoppes
     straks — uafhaengigt af pH og af noedstop-laasen."""
@@ -453,14 +457,15 @@ def publish_status(dose_fired):
 
 
 def fire_dose(now):
-    """Udloes en dosering: publicér en tom besked til DOSE_TOPIC.
+    """Udloes en dosering: publicér varigheden (sekunder) til DOSE_TOPIC, saa
+    noden koerer pumpe 1 (pH-down) i DOSE_SECONDS.
 
     Taeller kun doseringen, hvis publiceringen faktisk lykkedes, saa en
     fejlet besked hverken blokerer eller springer en reel dosering over.
     """
     global last_dose_time, dose_count, last_dose_command
     try:
-        info = client.publish(DOSE_TOPIC, payload=b"", qos=0)
+        info = client.publish(DOSE_TOPIC, f"{DOSE_SECONDS:g}", qos=0)
         if info.rc != mqtt.MQTT_ERR_SUCCESS:
             log.warning("kunne ikke sende dosering (rc=%s) — proever igen", info.rc)
             return False
@@ -474,7 +479,10 @@ def fire_dose(now):
     last_dose_time = now
     dose_count += 1
     save_state()
-    log.info("DOSERING udloest: pH-down sendt (%d/%d i dag)", dose_count, settings["max_doses_per_day"])
+    log.info(
+        "DOSERING udloest: pumpe 1 koerer %.1fs (%d/%d i dag)",
+        DOSE_SECONDS, dose_count, settings["max_doses_per_day"],
+    )
     return True
 
 

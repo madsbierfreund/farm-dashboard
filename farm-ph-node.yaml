@@ -1,0 +1,283 @@
+# ESPHome-konfiguration for pH-noden (FireBeetle 2 ESP32-E).
+#
+# VIGTIGT: Denne fil dækker PUMPESTYRINGEN. Nodens eksisterende sensorer
+# (pH, pH-spænding, vandtemperatur, EC) defineres andetsteds og skal flettes
+# ind her — deres hardware-konfiguration ligger ikke i repoet. `topic_prefix`
+# er sat til `farm/ph_node`, så de merges rene ind og bliver ved med at
+# publicere til farm/ph_node/sensor/<navn>/state.
+#
+# Fire DFR0523 peristaltiske pumper på IO-shieldet, servo-style PPM-signal:
+#   pumpe 1  pH-down      D7   GPIO13
+#   pumpe 2  gødning A    D10  GPIO17
+#   pumpe 3  gødning B    D11  GPIO16
+#   pumpe 4  gødning C    D12  GPIO4
+#
+# Strøm er en separat 6 V / 2 A-forsyning, så KUN én pumpe må køre ad gangen.
+
+substitutions:
+  node_name: farm-ph-node
+
+esphome:
+  name: ${node_name}
+  # Alle pumper skal være slukket ved boot — en kørsel må aldrig genoptages
+  # efter en reboot. Globals er restore_value: no, og vi tvinger servoerne til
+  # tomgang (stop) her.
+  on_boot:
+    priority: -100
+    then:
+      - servo.write: { id: servo_1, level: 0% }
+      - servo.write: { id: servo_2, level: 0% }
+      - servo.write: { id: servo_3, level: 0% }
+      - servo.write: { id: servo_4, level: 0% }
+      - lambda: "id(pump_active) = 0;"
+
+esp32:
+  board: dfrobot_firebeetle2_esp32e
+  framework:
+    type: arduino
+
+logger:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+mqtt:
+  broker: !secret mqtt_broker
+  username: !secret mqtt_username
+  password: !secret mqtt_password
+  # Nodens egne sensorer ligger under dette prefix (farm/ph_node/...).
+  # Pumpe-emnerne nedenfor er absolutte (farm/pump/...), uafhængigt af prefix.
+  topic_prefix: farm/ph_node
+  on_connect:
+    # Genskab den retained tilstand efter boot/reconnect: alt er slukket.
+    - mqtt.publish: { topic: farm/pump/1/state, payload: "off", retain: true }
+    - mqtt.publish: { topic: farm/pump/2/state, payload: "off", retain: true }
+    - mqtt.publish: { topic: farm/pump/3/state, payload: "off", retain: true }
+    - mqtt.publish: { topic: farm/pump/4/state, payload: "off", retain: true }
+  on_message:
+    # Payload = varighed i sekunder som tal. Kør den navngivne pumpe fremad i
+    # varigheden og stop så. Afvis (og log warning), hvis en anden pumpe kører,
+    # eller varigheden er uden for 0,5–30 s.
+    - topic: farm/pump/1/run
+      then:
+        - lambda: |-
+            float secs = atof(x.c_str());
+            if (id(pump_active) != 0) {
+              ESP_LOGW("pump", "pumpe 1 afvist: pumpe %d koerer allerede", id(pump_active));
+              return;
+            }
+            if (secs < 0.5f || secs > 30.0f) {
+              ESP_LOGW("pump", "pumpe 1 afvist: ugyldig varighed %.2f s (0.5-30)", secs);
+              return;
+            }
+            id(run_secs) = secs;
+            id(pump_active) = 1;
+            id(run_pump_1).execute();
+    - topic: farm/pump/2/run
+      then:
+        - lambda: |-
+            float secs = atof(x.c_str());
+            if (id(pump_active) != 0) {
+              ESP_LOGW("pump", "pumpe 2 afvist: pumpe %d koerer allerede", id(pump_active));
+              return;
+            }
+            if (secs < 0.5f || secs > 30.0f) {
+              ESP_LOGW("pump", "pumpe 2 afvist: ugyldig varighed %.2f s (0.5-30)", secs);
+              return;
+            }
+            id(run_secs) = secs;
+            id(pump_active) = 2;
+            id(run_pump_2).execute();
+    - topic: farm/pump/3/run
+      then:
+        - lambda: |-
+            float secs = atof(x.c_str());
+            if (id(pump_active) != 0) {
+              ESP_LOGW("pump", "pumpe 3 afvist: pumpe %d koerer allerede", id(pump_active));
+              return;
+            }
+            if (secs < 0.5f || secs > 30.0f) {
+              ESP_LOGW("pump", "pumpe 3 afvist: ugyldig varighed %.2f s (0.5-30)", secs);
+              return;
+            }
+            id(run_secs) = secs;
+            id(pump_active) = 3;
+            id(run_pump_3).execute();
+    - topic: farm/pump/4/run
+      then:
+        - lambda: |-
+            float secs = atof(x.c_str());
+            if (id(pump_active) != 0) {
+              ESP_LOGW("pump", "pumpe 4 afvist: pumpe %d koerer allerede", id(pump_active));
+              return;
+            }
+            if (secs < 0.5f || secs > 30.0f) {
+              ESP_LOGW("pump", "pumpe 4 afvist: ugyldig varighed %.2f s (0.5-30)", secs);
+              return;
+            }
+            id(run_secs) = secs;
+            id(pump_active) = 4;
+            id(run_pump_4).execute();
+    # Nødstop: sluk alle pumper straks — også midt i en kørsel. script.stop
+    # afbryder den kørende timer, så den pre-empter en igangværende kørsel.
+    - topic: farm/pump/stop_all
+      then:
+        - script.stop: run_pump_1
+        - script.stop: run_pump_2
+        - script.stop: run_pump_3
+        - script.stop: run_pump_4
+        - servo.write: { id: servo_1, level: 0% }
+        - servo.write: { id: servo_2, level: 0% }
+        - servo.write: { id: servo_3, level: 0% }
+        - servo.write: { id: servo_4, level: 0% }
+        - mqtt.publish: { topic: farm/pump/1/state, payload: "off", retain: true }
+        - mqtt.publish: { topic: farm/pump/2/state, payload: "off", retain: true }
+        - mqtt.publish: { topic: farm/pump/3/state, payload: "off", retain: true }
+        - mqtt.publish: { topic: farm/pump/4/state, payload: "off", retain: true }
+        - lambda: |-
+            id(pump_active) = 0;
+            ESP_LOGW("pump", "NOEDSTOP: alle pumper stoppet (farm/pump/stop_all)");
+
+# Fælles tilstand. restore_value: no → nulstilles ved boot (ingen genoptagelse).
+globals:
+  - id: pump_active   # hvilken pumpe kører lige nu (0 = ingen)
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: run_secs      # ønsket varighed for den aktuelle kørsel (sekunder)
+    type: float
+    restore_value: no
+    initial_value: "0"
+
+# --- PWM-udgange (ledc @ 50 Hz) og servoer (5 % / 7,5 % / 10 %) ---
+output:
+  - platform: ledc
+    id: pwm_1
+    pin: GPIO13
+    frequency: 50 Hz
+  - platform: ledc
+    id: pwm_2
+    pin: GPIO17
+    frequency: 50 Hz
+  - platform: ledc
+    id: pwm_3
+    pin: GPIO16
+    frequency: 50 Hz
+  - platform: ledc
+    id: pwm_4
+    pin: GPIO4
+    frequency: 50 Hz
+
+servo:
+  - id: servo_1
+    output: pwm_1
+    min_level: 5%
+    idle_level: 7.5%
+    max_level: 10%
+    auto_detach_time: 0s
+  - id: servo_2
+    output: pwm_2
+    min_level: 5%
+    idle_level: 7.5%
+    max_level: 10%
+    auto_detach_time: 0s
+  - id: servo_3
+    output: pwm_3
+    min_level: 5%
+    idle_level: 7.5%
+    max_level: 10%
+    auto_detach_time: 0s
+  - id: servo_4
+    output: pwm_4
+    min_level: 5%
+    idle_level: 7.5%
+    max_level: 10%
+    auto_detach_time: 0s
+
+# --- Kørselsscripts: fremad (100 %) i run_secs, så stop (tomgang). ---
+# Ét script pr. pumpe, så nødstoppet kan stoppe præcis den kørende timer.
+script:
+  - id: run_pump_1
+    mode: single
+    then:
+      - mqtt.publish: { topic: farm/pump/1/state, payload: "on", retain: true }
+      - servo.write: { id: servo_1, level: 100% }
+      - delay: !lambda "return (uint32_t)(id(run_secs) * 1000.0f);"
+      - servo.write: { id: servo_1, level: 0% }
+      - mqtt.publish: { topic: farm/pump/1/state, payload: "off", retain: true }
+      - lambda: "id(pump_active) = 0;"
+  - id: run_pump_2
+    mode: single
+    then:
+      - mqtt.publish: { topic: farm/pump/2/state, payload: "on", retain: true }
+      - servo.write: { id: servo_2, level: 100% }
+      - delay: !lambda "return (uint32_t)(id(run_secs) * 1000.0f);"
+      - servo.write: { id: servo_2, level: 0% }
+      - mqtt.publish: { topic: farm/pump/2/state, payload: "off", retain: true }
+      - lambda: "id(pump_active) = 0;"
+  - id: run_pump_3
+    mode: single
+    then:
+      - mqtt.publish: { topic: farm/pump/3/state, payload: "on", retain: true }
+      - servo.write: { id: servo_3, level: 100% }
+      - delay: !lambda "return (uint32_t)(id(run_secs) * 1000.0f);"
+      - servo.write: { id: servo_3, level: 0% }
+      - mqtt.publish: { topic: farm/pump/3/state, payload: "off", retain: true }
+      - lambda: "id(pump_active) = 0;"
+  - id: run_pump_4
+    mode: single
+    then:
+      - mqtt.publish: { topic: farm/pump/4/state, payload: "on", retain: true }
+      - servo.write: { id: servo_4, level: 100% }
+      - delay: !lambda "return (uint32_t)(id(run_secs) * 1000.0f);"
+      - servo.write: { id: servo_4, level: 0% }
+      - mqtt.publish: { topic: farm/pump/4/state, payload: "off", retain: true }
+      - lambda: "id(pump_active) = 0;"
+
+# --- Kalibreringsknapper: kør hver pumpe 10 s ved fuld hastighed. ---
+button:
+  - platform: template
+    name: "Kalibrer pumpe 1 – pH-down (10 s)"
+    on_press:
+      - lambda: |-
+          if (id(pump_active) != 0) {
+            ESP_LOGW("pump", "kalibrering pumpe 1 afvist: pumpe %d koerer", id(pump_active));
+            return;
+          }
+          id(run_secs) = 10.0f;
+          id(pump_active) = 1;
+          id(run_pump_1).execute();
+  - platform: template
+    name: "Kalibrer pumpe 2 – gødning A (10 s)"
+    on_press:
+      - lambda: |-
+          if (id(pump_active) != 0) {
+            ESP_LOGW("pump", "kalibrering pumpe 2 afvist: pumpe %d koerer", id(pump_active));
+            return;
+          }
+          id(run_secs) = 10.0f;
+          id(pump_active) = 2;
+          id(run_pump_2).execute();
+  - platform: template
+    name: "Kalibrer pumpe 3 – gødning B (10 s)"
+    on_press:
+      - lambda: |-
+          if (id(pump_active) != 0) {
+            ESP_LOGW("pump", "kalibrering pumpe 3 afvist: pumpe %d koerer", id(pump_active));
+            return;
+          }
+          id(run_secs) = 10.0f;
+          id(pump_active) = 3;
+          id(run_pump_3).execute();
+  - platform: template
+    name: "Kalibrer pumpe 4 – gødning C (10 s)"
+    on_press:
+      - lambda: |-
+          if (id(pump_active) != 0) {
+            ESP_LOGW("pump", "kalibrering pumpe 4 afvist: pumpe %d koerer", id(pump_active));
+            return;
+          }
+          id(run_secs) = 10.0f;
+          id(pump_active) = 4;
+          id(run_pump_4).execute();

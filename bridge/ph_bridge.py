@@ -23,11 +23,13 @@ INTERVAL = int(os.environ.get("INTERVAL_SECONDS", "300"))
 LIVE_URL = os.environ.get("LIVE_URL")
 LIVE_INTERVAL = int(os.environ.get("LIVE_INTERVAL_SECONDS", "15"))
 
-# Doseringslog: naar doseren udloeser en dosis, logges den i databasen.
+# Doseringslog: en dosis er nu en koersel af pumpe 1 (pH-down) via noden. Vi
+# lytter paa koerselskommandoen (farm/pump/1/run), laeser varigheden i sekunder
+# og udleder volumenet fra den (ml = sekunder * ML_PER_SECOND) i stedet for en
+# fast 2 ml pr. dosis. Saadan bliver reservoir-sporingen ved med at virke.
 DOSE_URL = os.environ.get("DOSE_URL")
-ML_PER_DOSE = float(os.environ.get("ML_PER_DOSE", "2.0"))
-DOSE_SECONDS = float(os.environ.get("DOSE_SECONDS", "5.0"))
-DOSE_TOPIC = "farm/dose/ph_down"
+ML_PER_SECOND = float(os.environ.get("ML_PER_SECOND", "0.4"))
+DOSE_TOPIC = "farm/pump/1/run"
 
 # Indstillinger fra web-panelet relayes til doseren via MQTT (retained), saa
 # doseren aldrig afhaenger af internettet ved runtime.
@@ -74,7 +76,11 @@ def on_connect(client, userdata, flags, reason_code, properties=None):
 
 def on_message(client, userdata, msg):
     if msg.topic == DOSE_TOPIC:
-        maybe_send_dose()
+        try:
+            seconds = float(msg.payload.decode())
+        except ValueError:
+            return  # ikke-numerisk varighed — ignorér
+        maybe_send_dose(seconds)
         return
     field = TOPICS.get(msg.topic)
     if field is None:
@@ -156,9 +162,14 @@ def maybe_send_live():
     threading.Thread(target=live_send, args=(snapshot,), daemon=True).start()
 
 
-def dose_send():
-    """Logger en dosering i databasen. Kaldes paa en worker-traad."""
-    payload = {"ml": ML_PER_DOSE, "seconds": DOSE_SECONDS, "kind": "ph_down"}
+def dose_send(seconds):
+    """Logger en dosering i databasen. Kaldes paa en worker-traad. Volumenet
+    udledes af koerselstiden: ml = sekunder * ML_PER_SECOND."""
+    payload = {
+        "ml": round(seconds * ML_PER_SECOND, 3),
+        "seconds": seconds,
+        "kind": "ph_down",
+    }
     data = json.dumps(payload).encode()
     req = urllib.request.Request(
         DOSE_URL,
@@ -178,12 +189,12 @@ def dose_send():
         print(f"dose netvaerksfejl: {err}", flush=True)
 
 
-def maybe_send_dose():
+def maybe_send_dose(seconds):
     """Logger en dosering off-callback, saa et langsomt eller fejlende POST
     aldrig blokerer MQTT-callbacket."""
     if not DOSE_URL:
         return
-    threading.Thread(target=dose_send, daemon=True).start()
+    threading.Thread(target=dose_send, args=(seconds,), daemon=True).start()
 
 
 def fetch_settings():

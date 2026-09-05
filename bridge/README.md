@@ -17,8 +17,7 @@ Opret ~/farm-dashboard/bridge/.env med:
     LIVE_URL=https://farm-dashboard.vercel.app/api/live
     LIVE_INTERVAL_SECONDS=15
     DOSE_URL=https://farm-dashboard.vercel.app/api/dose
-    ML_PER_DOSE=2.0
-    DOSE_SECONDS=5.0
+    ML_PER_SECOND=0.4
     SETTINGS_URL=https://farm-dashboard.vercel.app/api/settings
     SETTINGS_POLL_SECONDS=60
 
@@ -26,10 +25,11 @@ Opret ~/farm-dashboard/bridge/.env med:
 live-opdateringerne over. `LIVE_INTERVAL_SECONDS` (standard 15) er den
 korteste tid mellem to live-POST'er.
 
-`DOSE_URL` logger doseringer i databasen: naar der kommer en besked paa
-`farm/dose/ph_down`, sendes `ML_PER_DOSE` (standard 2.0) ml og `DOSE_SECONDS`
-(standard 5.0) sekunder til endpointet. Udelades `DOSE_URL`, springes
-doseringsloggen over.
+`DOSE_URL` logger doseringer i databasen: naar der kommer en koerselskommando
+paa `farm/pump/1/run` (varighed i sekunder), udledes volumenet af varigheden
+— `ml = sekunder * ML_PER_SECOND` (standard 0.4) — og sendes sammen med
+sekunderne til endpointet. Saadan bliver reservoir-sporingen ved med at virke.
+Udelades `DOSE_URL`, springes doseringsloggen over.
 
 `SETTINGS_URL` henter doseringsindstillingerne fra web-panelet hvert
 `SETTINGS_POLL_SECONDS` (standard 60) og relayer dem til MQTT-emnet
@@ -51,16 +51,18 @@ Log:
 # pH-doser
 
 `ph_doser.py` styrer pH-down doseringen. Den taler kun med den lokale
-MQTT-broker og publicerer en tom besked til `farm/dose/ph_down`, som et
-Homey-flow lytter paa og koerer pumpen i faste 5 sekunder. Ingen internetadgang
-er noedvendig, og mistet net stopper aldrig doseringen.
+MQTT-broker og publicerer varigheden i sekunder til `farm/pump/1/run`, hvorpaa
+ESPHome-noden koerer pumpe 1 (pH-down) i `DOSE_SECONDS`. Homey-flowsene er ikke
+laengere en del af doseringsvejen. Ingen internetadgang er noedvendig, og mistet
+net stopper aldrig doseringen.
 
 Opret `~/farm-dashboard/bridge/.env.doser` med:
 
     MQTT_HOST=localhost
     MQTT_USER=farm
     MQTT_PASSWORD=...
-    DOSE_TOPIC=farm/dose/ph_down
+    DOSE_TOPIC=farm/pump/1/run
+    DOSE_SECONDS=5.0
     ENABLED=true
     DOSE_ABOVE=6.3
     TARGET_PH=6.1
@@ -120,17 +122,17 @@ sende status, men doserer ikke:
 
 ## Noedstop og laas (to uafhaengige sikkerhedsforanstaltninger)
 
-Pumpen styres via et Homey-flow, der taender og slukker en Philips Hue-kontakt.
-Hue-broen kan selv taende kontakten uden for vores kontrol — det skete én gang,
-og pumpen koerte i tolv timer og trak tankens pH ned til 1,79. To uafhaengige
-sikkerhedsforanstaltninger beskytter mod det:
+Pumpen koeres nu af ESPHome-noden. Tidligere kunne Hue-broen selv taende
+kontakten uden for vores kontrol — det skete én gang, og pumpen koerte i tolv
+timer og trak tankens pH ned til 1,79. To uafhaengige sikkerhedsforanstaltninger
+beskytter mod det:
 
 1. **pH-gulv.** Falder pH under `PH_EMERGENCY_FLOOR` (standard 5,0) paa en
-   maaling, sender doseren straks en tom besked til `farm/dose/ph_down_stop`
-   (som Homey bruger til at slukke pumpen), skriver en laasefil og logger en
-   ERROR. Stop-beskeden gentages, saa laenge pH er under gulvet, hoejst én gang
-   pr. 10 sekunder. Tjekket koerer bevidst UDEN for sanitetstjekket, saa en
-   reel, farligt lav pH ikke fejlagtigt ignoreres som "probe ude af vand".
+   maaling, sender doseren straks en besked til `farm/pump/stop_all` (som faar
+   noden til at stoppe alle pumper), skriver en laasefil og logger en ERROR.
+   Stop-beskeden gentages, saa laenge pH er under gulvet, hoejst én gang pr. 10
+   sekunder. Tjekket koerer bevidst UDEN for sanitetstjekket, saa en reel,
+   farligt lav pH ikke fejlagtigt ignoreres som "probe ude af vand".
 
 2. **Laas.** Saa laenge laasefilen (`PH_EMERGENCY_LATCH_FILE`, standard
    `/var/lib/ph-doser/emergency.lock`) findes, doserer styringen **aldrig**,
@@ -147,28 +149,26 @@ Mappen `/var/lib/ph-doser` oprettes automatisk (ejet af tjenestens bruger) via
 
 ## Tilstands-watchdog (uautoriseret taend)
 
-Pumpen er en Philips Hue-kontakt. Hue-broen kan taende den af sig selv, uden
-for vores kontrol — det skete, og pumpen koerte i tolv timer. To Homey-flows
-publicerer kontaktens faktiske tilstand ("on"/"off") til `farm/state/ph_down`,
-og doseren lytter med som en watchdog:
+Noden publicerer pumpe 1's faktiske tilstand ("on"/"off", retained) til
+`farm/pump/1/state`, og doseren lytter med som en watchdog:
 
 - Kommer et **"on"** inden for `DOSE_WINDOW_S` (standard 8 s) af doserens egen
-  seneste kommando til `farm/dose/ph_down`, er det vores egen dosis — der sker
+  seneste kommando til `farm/pump/1/run`, er det vores egen dosis — der sker
   intet.
 - Ethvert andet "on" er **uautoriseret**: doseren sender straks et stop til
-  `farm/dose/ph_down_stop` og logger en ERROR med tiden siden sidste
-  kommanderede dosis. Dette er uafhaengigt af pH og virker ogsaa, mens
-  noedstop-laasen er sat.
-- Bliver kontakten ved med at melde "on", gentages stoppet — hoejst ét pr.
-  sekund. Efter `UNAUTHORIZED_MAX_STOPS` (standard 10) forgaeves stop uden et
-  "off" saettes noedstop-laasen, og der logges en CRITICAL: kontakten reagerer
-  ikke. Doseren bliver ved med at sende stop.
+  `farm/pump/stop_all` og logger en ERROR med tiden siden sidste kommanderede
+  dosis. Dette er uafhaengigt af pH og virker ogsaa, mens noedstop-laasen er
+  sat.
+- Bliver pumpen ved med at melde "on", gentages stoppet — hoejst ét pr. sekund.
+  Efter `UNAUTHORIZED_MAX_STOPS` (standard 10) forgaeves stop uden et "off"
+  saettes noedstop-laasen, og der logges en CRITICAL: pumpen reagerer ikke.
+  Doseren bliver ved med at sende stop.
 - Et **"off"** nulstiller taelleren for forgaeves stop.
-- Er der ikke set en tilstand paa `farm/state/ph_down` i `STATE_STALE_S`
+- Er der ikke set en tilstand paa `farm/pump/1/state` i `STATE_STALE_S`
   (standard 900 s), logges en WARNING om, at watchdog'en er blind. Der laases
   **aldrig** paa staleness alene.
 
-Kontaktens sidst kendte tilstand, tidspunktet, om watchdog'en er blind, og
+Pumpens sidst kendte tilstand, tidspunktet, om watchdog'en er blind, og
 antallet af forgaeves stop vises ogsaa i `farm/dose/status`.
 
 ## Tests

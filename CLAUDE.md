@@ -42,15 +42,18 @@ a record of current state, not something to re-run there. See
 - `INTERVAL_SECONDS` (default `300`) — median flush interval.
 - `LIVE_URL` — the `/api/live` endpoint; omit to disable live posting.
 - `LIVE_INTERVAL_SECONDS` (default `15`) — minimum gap between live POSTs.
-- `DOSE_URL` — the `/api/dose` endpoint; omit to disable dose logging.
-- `ML_PER_DOSE` (default `2.0`), `DOSE_SECONDS` (default `5.0`) — values
-  logged per dose.
+- `DOSE_URL` — the `/api/dose` endpoint; omit to disable dose logging. Logs
+  from the pump run command on `farm/pump/1/run`.
+- `ML_PER_SECOND` (default `0.4`) — volume per second; the logged ml is
+  derived from the run duration (`ml = seconds * ML_PER_SECOND`).
 
 ### Doser on the Pi — `bridge/.env.doser` (read by `bridge/ph_doser.py`)
 
 - `MQTT_HOST` (default `localhost`), `MQTT_PORT` (default `1883`),
   `MQTT_USER`, `MQTT_PASSWORD` — local MQTT broker.
-- `DOSE_TOPIC` (default `farm/dose/ph_down`) — topic the pump listens on.
+- `DOSE_TOPIC` (default `farm/pump/1/run`) — pump-run topic the ESPHome node
+  listens on; the doser publishes the run duration in seconds here.
+- `DOSE_SECONDS` (default `5.0`) — how long pump 1 runs per dose.
 - `ENABLED` (default `true`) — set `false` to pause dosing.
 - `DOSE_ABOVE` (default `6.3`) — dose when pH is above this.
 - `TARGET_PH` (default `6.1`) — stop dosing once at or below this.

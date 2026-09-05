@@ -50,6 +50,17 @@ class FakeClient:
     def topics(self):
         return [t for (t, *_rest) in self.published]
 
+    def payloads_on(self, topic):
+        return [p for (t, p, *_rest) in self.published if t == topic]
+
+
+class FakeMsg:
+    """Minimal efterligning af en paho MQTT-besked."""
+
+    def __init__(self, topic, payload):
+        self.topic = topic
+        self.payload = payload
+
 
 class DoserTestBase(unittest.TestCase):
     def setUp(self):
@@ -62,6 +73,7 @@ class DoserTestBase(unittest.TestCase):
         d.SANITY_MIN = 4.0
         d.SANITY_MAX = 9.0
         d.STALE_SECONDS = 120
+        d.DOSE_SECONDS = 5.0
 
         d.settings = {
             "enabled": True,
@@ -205,6 +217,33 @@ class WatchdogTests(DoserTestBase):
 
         self.assertTrue(any("blind" in line for line in cm.output))
         self.assertFalse(d.latch_exists())
+
+
+class NodePathTests(DoserTestBase):
+    """Ny node-vej: pumpe-koersel, nødstop og watchdog paa de nye emner."""
+
+    def test_dose_publishes_duration_seconds(self):
+        d.on_ph(7.0)  # over dose_above; én maaling er nok → dosering
+
+        self.assertEqual(d.DOSE_TOPIC, "farm/pump/1/run")
+        payloads = d.client.payloads_on(d.DOSE_TOPIC)
+        self.assertEqual(len(payloads), 1)
+        # Payload skal vaere et tal i sekunder lig med DOSE_SECONDS.
+        self.assertEqual(float(payloads[0]), d.DOSE_SECONDS)
+
+    def test_emergency_stop_publishes_stop_all(self):
+        self.assertEqual(d.STOP_TOPIC, "farm/pump/stop_all")
+        d.emergency_stop(2.0, 100.0)
+        self.assertIn("farm/pump/stop_all", d.client.topics())
+
+    def test_watchdog_reacts_to_pump_state_topic(self):
+        # En uautoriseret "on" paa det nye state-emne udloeser et stop.
+        self.assertEqual(d.STATE_TOPIC, "farm/pump/1/state")
+        d.on_message(None, None, FakeMsg("farm/pump/1/state", b"on"))
+
+        self.assertIn(d.STOP_TOPIC, d.client.topics())
+        self.assertEqual(d.switch_state, "on")
+        self.assertEqual(d.unauthorized_stops, 1)
 
 
 if __name__ == "__main__":
