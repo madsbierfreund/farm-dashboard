@@ -14,11 +14,15 @@ const BAND = '#4ade80';
 
 // Formatér et pH-tal med dansk decimalkomma til labels.
 const phLabel = v => v.toLocaleString('da-DK', { minimumFractionDigits: 1 });
-// Doseringssøjler i violet — tydeligt adskilt fra den grønne og gule kurve.
+// pH-down doseringssøjler i violet — tydeligt adskilt fra den grønne og gule kurve.
 const DOSE = '#a78bfa';
 // EC-linje i cyan — adskilt fra grøn pH, gul temperatur og violette søjler.
 const EC = '#38bdf8';
-// Andel af plothøjden nederst, der er reserveret til doseringssøjler.
+// Gødningsfarver — indbyrdes distinkte og adskilt fra pH-down (violet).
+const FERT = { micro: '#ec4899', grow: '#2dd4bf', bloom: '#fb923c' };
+const FERT_LABELS = { micro: 'Micro', grow: 'Grow', bloom: 'Bloom' };
+const FERT_ORDER = ['micro', 'grow', 'bloom']; // stakkes nedefra og op
+// Andel af plothøjden nederst, der er reserveret til hver doseringsstribe.
 const DOSE_BAND = 0.15;
 
 const W = 760, H = 280;
@@ -96,20 +100,38 @@ export default function ChartZoom({ points, doses = [], bucketMs, windowStart, w
   const hasTemp = visible.some(p => p.temp != null);
   const hasEc = visible.some(p => p.ec != null);
 
-  // Bucket doseringerne på det samme gitter som målingernes nedsampling:
-  // hele vinduet delt i nB buckets, forankret til vinduets start, så de ikke
-  // flytter sig ved zoom. Højden pr. søjle er de samlede ml i bucketen.
+  // Bucket doseringerne på det samme gitter som målingernes nedsampling: hele
+  // vinduet delt i nB buckets, forankret til vinduets start, så de ikke flytter
+  // sig ved zoom. pH-down og gødning holdes adskilt (hver sin skala). For
+  // gødning summeres pr. kind, så bucketen kan stakkes Micro/Grow/Bloom.
   const bMs = bucketMs || (windowEnd - windowStart) / 400;
   const nB = Math.max(1, Math.round((windowEnd - windowStart) / bMs));
-  const bucketMl = new Map();
+  const phBuckets = new Map();   // idx -> ml (ph_down)
+  const fertBuckets = new Map(); // idx -> { micro, grow, bloom }
   for (const d of doses) {
     let idx = Math.floor((d.t - windowStart) / bMs);
     if (idx < 0) idx = 0;
     if (idx >= nB) idx = nB - 1;
-    bucketMl.set(idx, (bucketMl.get(idx) || 0) + d.ml);
+    if (d.kind === 'ph_down') {
+      phBuckets.set(idx, (phBuckets.get(idx) || 0) + d.ml);
+    } else {
+      const name = String(d.kind || '').split('-').pop(); // pump3-micro -> micro
+      if (FERT_ORDER.includes(name)) {
+        let b = fertBuckets.get(idx);
+        if (!b) {
+          b = { micro: 0, grow: 0, bloom: 0 };
+          fertBuckets.set(idx, b);
+        }
+        b[name] += d.ml;
+      }
+    }
   }
-  const maxMl = bucketMl.size ? Math.max(...bucketMl.values()) : 0;
-  const hasDoses = bucketMl.size > 0;
+  const phMax = phBuckets.size ? Math.max(...phBuckets.values()) : 0;
+  const fertMax = fertBuckets.size
+    ? Math.max(...[...fertBuckets.values()].map(b => b.micro + b.grow + b.bloom))
+    : 0;
+  const hasPh = phBuckets.size > 0;
+  const hasFert = fertBuckets.size > 0;
 
   const legendItem = { display: 'flex', alignItems: 'center', gap: 6, opacity: 0.7 };
   const swatch = c => ({ width: 14, height: 2, background: c, display: 'inline-block' });
@@ -165,11 +187,16 @@ export default function ChartZoom({ points, doses = [], bucketMs, windowStart, w
         <span style={legendItem}>
           <span style={bandSwatch(0.4)} /> Optimalt {phLabel(OPT_LO)}–{phLabel(OPT_HI)}
         </span>
-        {hasDoses && (
+        {hasPh && (
           <span style={legendItem}>
-            <span style={{ width: 10, height: 12, background: DOSE, borderRadius: 1, display: 'inline-block' }} /> Dosering (ml)
+            <span style={{ width: 10, height: 12, background: DOSE, borderRadius: 1, display: 'inline-block' }} /> pH-ned (ml)
           </span>
         )}
+        {hasFert && FERT_ORDER.map(name => (
+          <span key={name} style={legendItem}>
+            <span style={{ width: 10, height: 12, background: FERT[name], borderRadius: 1, display: 'inline-block' }} /> {FERT_LABELS[name]} (ml)
+          </span>
+        ))}
         {zoom && (
           <button
             onClick={() => setZoom(null)}
@@ -215,8 +242,10 @@ export default function ChartZoom({ points, doses = [], bucketMs, windowStart, w
           view1={view1}
           hover={drag ? null : hover}
           hidden={hidden}
-          bucketMl={bucketMl}
-          maxMl={maxMl}
+          phBuckets={phBuckets}
+          phMax={phMax}
+          fertBuckets={fertBuckets}
+          fertMax={fertMax}
           bucketMs={bMs}
           windowStart={windowStart}
           nB={nB}
@@ -232,17 +261,25 @@ export default function ChartZoom({ points, doses = [], bucketMs, windowStart, w
 // Ren tegnefunktion: akser, målbånd, gitter og kurverne for et givet
 // tidsvindue. Skalaerne tilpasses de synlige punkter, så zoom også omregner Y.
 // hidden.{ph,temp,ec} skjuler en serie og dens akse.
-function ChartBody({ points, view0, view1, hover, hidden, bucketMl, maxMl, bucketMs, windowStart, nB }) {
+function ChartBody({ points, view0, view1, hover, hidden, phBuckets, phMax, fertBuckets, fertMax, bucketMs, windowStart, nB }) {
   const span = view1 - view0;
   const h = hidden || {};
 
-  // Reservér en stribe nederst til doseringssøjler, så kurverne beholder deres
-  // egen plads ovenfor og ikke mases sammen med søjlerne.
+  // Reservér separate striber nederst: pH-down nederst (uændret track/skala),
+  // gødning ovenover med sin egen ml-skala, så en lille gødningsdosis er
+  // læsbar ved siden af en større pH-down-dosis. Kun de striber, der har data,
+  // reserveres — så kurverne beholder mest mulig plads.
   const fullH = H - PADT - PADB;
-  const hasDoses = bucketMl && bucketMl.size > 0;
-  const doseBandH = hasDoses ? fullH * DOSE_BAND : 0;
-  const doseGap = hasDoses ? 6 : 0;
-  const lineBottom = H - PADB - doseBandH - doseGap;
+  const hasPh = phBuckets && phBuckets.size > 0;
+  const hasFert = fertBuckets && fertBuckets.size > 0;
+  const trackH = fullH * DOSE_BAND;
+  const doseGap = 6;
+  const baseline = H - PADB;
+  const phBaseline = baseline;                                          // pH-down nederst
+  const fertBaseline = hasPh ? baseline - trackH - doseGap : baseline;  // gødning ovenover
+  let lineBottom = H - PADB;
+  if (hasFert) lineBottom = fertBaseline - trackH - doseGap;
+  else if (hasPh) lineBottom = baseline - trackH - doseGap;
 
   // pH-akse (venstre) er altid den lodrette ramme (målbånd, gitter). Selve
   // pH-linjen og aksens tal skjules, når pH er slået fra.
@@ -374,14 +411,24 @@ function ChartBody({ points, view0, view1, hover, hidden, bucketMl, maxMl, bucke
     if (showEc && hover.ec != null) {
       lines.push({ text: `EC ${hover.ec.toFixed(2)} mS/cm`, fill: EC, opacity: 1 });
     }
-    // Doseringer i den bucket guiden står over.
-    if (hasDoses) {
-      let hidx = Math.floor((hover.t - windowStart) / bucketMs);
-      if (hidx < 0) hidx = 0;
-      if (hidx >= nB) hidx = nB - 1;
-      const hMl = bucketMl.get(hidx);
-      if (hMl) {
-        lines.push({ text: `Dosis ${hMl.toFixed(1).replace('.', ',')} ml`, fill: DOSE, opacity: 1 });
+    // Doseringer i den bucket guiden står over — pH-down og hver gødningskind.
+    let hidx = Math.floor((hover.t - windowStart) / bucketMs);
+    if (hidx < 0) hidx = 0;
+    if (hidx >= nB) hidx = nB - 1;
+    const phMl = phBuckets.get(hidx);
+    if (phMl) {
+      lines.push({ text: `pH-ned ${phMl.toFixed(1).replace('.', ',')} ml`, fill: DOSE, opacity: 1 });
+    }
+    const fb = fertBuckets.get(hidx);
+    if (fb) {
+      for (const name of FERT_ORDER) {
+        if (fb[name] > 0) {
+          lines.push({
+            text: `${FERT_LABELS[name]} ${fb[name].toFixed(1).replace('.', ',')} ml`,
+            fill: FERT[name],
+            opacity: 1
+          });
+        }
       }
     }
 
@@ -408,35 +455,57 @@ function ChartBody({ points, view0, view1, hover, hidden, bucketMl, maxMl, bucke
     );
   }
 
-  // Doseringssøjler langs bunden, med egen ml-skala i doseringsstriben.
-  const baseline = H - PADB;
-  const bandTop = lineBottom + doseGap;
+  // Doseringssøjler: pH-down nederst (violet, egen skala) og gødning ovenover
+  // (stakket Micro/Grow/Bloom, egen skala). Hver stribe har sit eget ml-loft.
+  const barWidthAt = tc => {
+    const wPx = x(tc + bucketMs / 2) - x(tc - bucketMs / 2);
+    return Math.max(1.5, Math.min(wPx * 0.7, 10));
+  };
   let doseEls = null;
-  if (hasDoses) {
-    const bars = [];
-    for (const [idx, ml] of bucketMl) {
-      const tc = windowStart + (idx + 0.5) * bucketMs;
-      if (tc < view0 || tc > view1) continue;
-      const cx = x(tc);
-      const wPx = x(tc + bucketMs / 2) - x(tc - bucketMs / 2);
-      const barW = Math.max(1.5, Math.min(wPx * 0.7, 10));
-      const barH = maxMl > 0 ? (ml / maxMl) * doseBandH : 0;
-      bars.push(
-        <rect key={`d-${idx}`} x={cx - barW / 2} y={baseline - barH} width={barW} height={barH} fill={DOSE} opacity="0.85" />
-      );
-    }
-    doseEls = (
-      <g>
-        <line x1={PADL} y1={baseline} x2={W - PADR} y2={baseline} stroke="#e8eaed" strokeWidth="1" opacity="0.08" />
-        <text x={PADL - 8} y={bandTop} textAnchor="end" dominantBaseline="middle" fill={DOSE} opacity="0.8" fontSize="10">
-          {maxMl.toFixed(1).replace('.', ',')} ml
-        </text>
-        <text x={PADL - 8} y={baseline} textAnchor="end" dominantBaseline="middle" fill={DOSE} opacity="0.6" fontSize="10">
+  if (hasPh || hasFert) {
+    const els = [];
+    if (hasPh) {
+      els.push(
+        <line key="ph-base" x1={PADL} y1={phBaseline} x2={W - PADR} y2={phBaseline} stroke="#e8eaed" strokeWidth="1" opacity="0.08" />,
+        <text key="ph-max" x={PADL - 8} y={phBaseline - trackH} textAnchor="end" dominantBaseline="middle" fill={DOSE} opacity="0.8" fontSize="10">
+          {phMax.toFixed(1).replace('.', ',')} ml
+        </text>,
+        <text key="ph-0" x={PADL - 8} y={phBaseline} textAnchor="end" dominantBaseline="middle" fill={DOSE} opacity="0.6" fontSize="10">
           0
         </text>
-        {bars}
-      </g>
-    );
+      );
+      for (const [idx, ml] of phBuckets) {
+        const tc = windowStart + (idx + 0.5) * bucketMs;
+        if (tc < view0 || tc > view1) continue;
+        const cx = x(tc);
+        const barW = barWidthAt(tc);
+        const barH = phMax > 0 ? (ml / phMax) * trackH : 0;
+        els.push(<rect key={`ph-${idx}`} x={cx - barW / 2} y={phBaseline - barH} width={barW} height={barH} fill={DOSE} opacity="0.85" />);
+      }
+    }
+    if (hasFert) {
+      els.push(
+        <line key="f-base" x1={PADL} y1={fertBaseline} x2={W - PADR} y2={fertBaseline} stroke="#e8eaed" strokeWidth="1" opacity="0.08" />,
+        <text key="f-max" x={PADL - 8} y={fertBaseline - trackH} textAnchor="end" dominantBaseline="middle" fill="#e8eaed" opacity="0.55" fontSize="10">
+          {fertMax.toFixed(1).replace('.', ',')} ml
+        </text>
+      );
+      for (const [idx, b] of fertBuckets) {
+        const tc = windowStart + (idx + 0.5) * bucketMs;
+        if (tc < view0 || tc > view1) continue;
+        const cx = x(tc);
+        const barW = barWidthAt(tc);
+        let yTop = fertBaseline;
+        for (const name of FERT_ORDER) {
+          const segMl = b[name];
+          if (segMl <= 0) continue;
+          const segH = fertMax > 0 ? (segMl / fertMax) * trackH : 0;
+          els.push(<rect key={`f-${idx}-${name}`} x={cx - barW / 2} y={yTop - segH} width={barW} height={segH} fill={FERT[name]} opacity="0.9" />);
+          yTop -= segH;
+        }
+      }
+    }
+    doseEls = <g>{els}</g>;
   }
 
   return (

@@ -47,7 +47,7 @@ export default async function Page({ searchParams }) {
         .limit(1),
       db
         .from('dose_events')
-        .select('dosed_at, ml')
+        .select('dosed_at, ml, kind')
         .gte('dosed_at', from_ts)
         .order('dosed_at', { ascending: true })
         .limit(2000),
@@ -79,9 +79,16 @@ export default async function Page({ searchParams }) {
 
   const doses = (doseRes.data ?? []).map(d => ({
     t: new Date(d.dosed_at).getTime(),
-    ml: d.ml
+    ml: d.ml,
+    kind: d.kind
   }));
-  const totalMl = doses.reduce((sum, d) => sum + d.ml, 0);
+  // pH-down og gødning holdes adskilt — de har hver deres skala og total.
+  const totalPhMl = doses
+    .filter(d => d.kind === 'ph_down')
+    .reduce((sum, d) => sum + d.ml, 0);
+  const totalFertMl = doses
+    .filter(d => d.kind !== 'ph_down')
+    .reduce((sum, d) => sum + d.ml, 0);
 
   // Doseringerne bucketes på samme gitter som RPC'ens buckets: hele vinduet
   // delt i MAX_POINTS buckets.
@@ -119,7 +126,7 @@ export default async function Page({ searchParams }) {
             windowStart={windowStart}
             windowEnd={now}
           />
-          <Stats stats={stats} totalMl={totalMl} />
+          <Stats stats={stats} totalPhMl={totalPhMl} totalFertMl={totalFertMl} />
         </>
       )}
 
@@ -160,15 +167,16 @@ function RangeButtons({ active }) {
   );
 }
 
-function Stats({ stats, totalMl }) {
+function Stats({ stats, totalPhMl, totalFertMl }) {
   const { min, avg, max, count } = stats;
+  const ml = v => `${v.toFixed(1).replace('.', ',')} ml`;
 
   const cell = { flex: 1 };
   const label = { fontSize: 11, opacity: 0.45, letterSpacing: 0.3 };
   const value = { fontSize: 20, fontWeight: 500 };
 
   return (
-    <div style={{ display: 'flex', gap: 24, marginTop: 24 }}>
+    <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap', marginTop: 24 }}>
       <div style={cell}>
         <div style={label}>MIN</div>
         <div style={value}>{Number(min).toFixed(2)}</div>
@@ -186,8 +194,12 @@ function Stats({ stats, totalMl }) {
         <div style={value}>{count}</div>
       </div>
       <div style={cell}>
-        <div style={label}>DOSERET</div>
-        <div style={value}>{totalMl.toFixed(1).replace('.', ',')} ml</div>
+        <div style={label}>PH-NED</div>
+        <div style={value}>{ml(totalPhMl)}</div>
+      </div>
+      <div style={cell}>
+        <div style={label}>GØDNING</div>
+        <div style={value}>{ml(totalFertMl)}</div>
       </div>
     </div>
   );
