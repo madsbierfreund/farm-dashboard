@@ -171,6 +171,91 @@ Noden publicerer pumpe 1's faktiske tilstand ("on"/"off", retained) til
 Pumpens sidst kendte tilstand, tidspunktet, om watchdog'en er blind, og
 antallet af forgaeves stop vises ogsaa i `farm/dose/status`.
 
+# EC-doser (goedning)
+
+`ec_doser.py` styrer goedningsdoseringen (Terra Aquatica TriPart) ved siden af
+pH-doseren. Den taler kun med den lokale MQTT-broker, samme moenster som
+ph_doser.py. Pumperne er: 2 = Bloom, 3 = Micro, 4 = Grow.
+
+En EC-dosis er TRE pumpekoersler i fast raekkefoelge med `PUMP_GAP_SECONDS`
+(standard 60) imellem: **Micro (pumpe 3) → Grow (pumpe 4) → Bloom (pumpe 2)**.
+Micro skal ALTID i foer Bloom — koncentreret calcium og fosfat udfaelder, hvis
+de moedes. Volumener kommer fra et vaekststadie og en enkelt dosisstoerrelse
+(`DOSE_ML_GROW`): Micro og Bloom skaleres fra Grow ved stadiets forhold. Hver
+volumen omregnes til en varighed via pumpens gennemstroemning. Falder en
+varighed uden for 0,5–30 s, springes HELE dosen over — en delvis dosis aendrer
+forholdet.
+
+Opret `~/farm-dashboard/bridge/.env.ec-doser` med:
+
+    MQTT_HOST=localhost
+    MQTT_USER=farm
+    MQTT_PASSWORD=...
+    EC_ENABLED=false
+    EC_TARGET=1.8
+    EC_DEADBAND=0.15
+    EC_COOLDOWN_MINUTES=60
+    EC_MAX_DOSES_PER_DAY=6
+    EC_CONSECUTIVE_READINGS=3
+    GROWTH_STAGE=growing
+    DOSE_ML_GROW=2.0
+    ML_PER_SECOND_PUMP_2=0.40
+    ML_PER_SECOND_PUMP_3=0.36
+    ML_PER_SECOND_PUMP_4=0.36
+    PUMP_GAP_SECONDS=60
+    EC_FLOOR=0.2
+    EC_EMERGENCY_CEILING=4.0
+    EC_EMERGENCY_LATCH_FILE=/var/lib/ec-doser/emergency.lock
+
+Alle vaerdier har fornuftige standardvaerdier. `EC_ENABLED`, `EC_TARGET`,
+`EC_DEADBAND`, `EC_COOLDOWN_MINUTES`, `EC_MAX_DOSES_PER_DAY`,
+`EC_CONSECUTIVE_READINGS`, `GROWTH_STAGE` og `DOSE_ML_GROW` **aendres normalt fra
+web-panelet** (afsnittet "EC-gødning") og relayes via `farm/ec/settings`;
+env er kun fallback. Panelet viser de tre resulterende volumener, foer du gemmer.
+
+Doseringsbeslutning: er EC under `EC_TARGET` minus `EC_DEADBAND` i
+`EC_CONSECUTIVE_READINGS` maalinger i traek, doseres der (med nedkoeling og
+dagligt loft som ph_doser).
+
+Sikkerhed:
+
+- **EC-gulv** (`EC_FLOOR`, standard 0,2): aflaesninger derunder ignoreres
+  (probe ude af vand), saa der ikke doseres paa en falsk lav vaerdi.
+- **EC-loft** (`EC_EMERGENCY_CEILING`, standard 4,0): gaar EC over loftet,
+  sendes `farm/pump/stop_all`, en laasefil skrives, og der doseres ikke, foer
+  filen slettes manuelt — samme form som ph_doser's pH-gulv og laas.
+- Foer hver af de tre koersler tjekkes `farm/pump/<n>/state`; melder en pumpe
+  "on" (fx pH-down koerer), afbrydes de resterende koersler.
+
+Emner: EC laeses paa `farm/ph_node/sensor/ec/state`; koersler sendes til
+`farm/pump/{3,4,2}/run`; status publiceres til `farm/ec/status` (aktuel EC,
+taeller, nedkoeling, doser i dag, dagligt loft, stadie, de tre volumener og
+varigheder, laasetilstand). Hver dosis logges ogsaa til `farm/ec/dose_log`, som
+`ph_bridge.py` relayer til `/api/dose`, saa goedningsdoser ses paa dashboardet
+med pumpenummer og goedningsnavn.
+
+Laas filen ned, opret mappen til laasefilen (via unit'ens `StateDirectory`) og
+start tjenesten:
+
+    chmod 600 ~/farm-dashboard/bridge/.env.ec-doser
+    sudo cp ~/farm-dashboard/bridge/ec-doser.service /etc/systemd/system/
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now ec-doser
+
+Log og status:
+
+    journalctl -u ec-doser -f
+    mosquitto_sub -h localhost -u farm -P '...' -t farm/ec/status -v
+
+Stop / ryd laas som for ph_doser:
+
+    sudo systemctl stop ec-doser
+    sudo rm /var/lib/ec-doser/emergency.lock
+
+**Migration:** EC-indstillingerne kraever kolonnerne fra
+`supabase/migrations/008_ec_settings.sql`. Koer den i Supabase' SQL Editor,
+foer panelet og relayet bruges.
+
 ## Tests
 
-    python3 -m unittest bridge.test_ph_doser
+    python3 -m unittest bridge.test_ph_doser bridge.test_ec_doser

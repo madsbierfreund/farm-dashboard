@@ -1,0 +1,17 @@
+[Unit]
+Description=EC-doser (lokal MQTT-styring af goedning)
+After=mosquitto.service
+
+[Service]
+Type=simple
+User=mbierfreund
+WorkingDirectory=/home/mbierfreund/farm-dashboard/bridge
+EnvironmentFile=/home/mbierfreund/farm-dashboard/bridge/.env.ec-doser
+ExecStart=/home/mbierfreund/bridge-venv/bin/python /home/mbierfreund/farm-dashboard/bridge/ec_doser.py
+Restart=always
+RestartSec=10
+# Opretter /var/lib/ec-doser (ejet af User) til noedstop-laasefilen.
+StateDirectory=ec-doser
+
+[Install]
+WantedBy=multi-user.target

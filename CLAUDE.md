@@ -66,6 +66,28 @@ a record of current state, not something to re-run there. See
 - `STATE_FILE` (default `~/.ph_doser_state.json`) — persists last-dose time
   and today's dose count.
 
+### EC doser on the Pi — `bridge/.env.ec-doser` (read by `bridge/ec_doser.py`)
+
+Fertiliser dosing (Terra Aquatica TriPart). A dose is three pump runs in fixed
+order Micro (pump 3) → Grow (pump 4) → Bloom (pump 2), `PUMP_GAP_SECONDS`
+(default `60`) apart. Volumes come from `GROWTH_STAGE` + `DOSE_ML_GROW`;
+durations from the per-pump flow rates.
+
+- `MQTT_HOST`/`MQTT_PORT`/`MQTT_USER`/`MQTT_PASSWORD` — local broker.
+- `EC_ENABLED` (default `false`), `EC_TARGET` (`1.8`), `EC_DEADBAND` (`0.15`),
+  `EC_COOLDOWN_MINUTES` (`60`), `EC_MAX_DOSES_PER_DAY` (`6`),
+  `EC_CONSECUTIVE_READINGS` (`3`), `GROWTH_STAGE` (`growing`), `DOSE_ML_GROW`
+  (`2.0`) — the settings-overridable set (relayed from the web panel via
+  `farm/ec/settings`; env is fallback).
+- `ML_PER_SECOND_PUMP_2` (`0.40`), `ML_PER_SECOND_PUMP_3` (`0.36`),
+  `ML_PER_SECOND_PUMP_4` (`0.36`) — measured flow rates (ml→seconds).
+- `PUMP_GAP_SECONDS` (`60`), `EC_FLOOR` (`0.2`, ignore below), stale/state as
+  ph_doser.
+- `EC_EMERGENCY_CEILING` (`4.0`) — EC above it → `farm/pump/stop_all` + latch;
+  `EC_EMERGENCY_LATCH_FILE` (`/var/lib/ec-doser/emergency.lock`).
+- Status on `farm/ec/status`; doses logged via `farm/ec/dose_log` (relayed to
+  `/api/dose` by the bridge).
+
 ## Conventions
 
 - No charting library, no Tailwind, no CSS modules, no new dependencies. The

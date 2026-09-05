@@ -14,9 +14,7 @@ function db() {
 export async function GET() {
   const { data, error } = await db()
     .from('doser_settings')
-    .select(
-      'id, enabled, dose_above, target_ph, cooldown_minutes, max_doses_per_day, consecutive_readings, updated_at'
-    )
+    .select('*')
     .eq('id', 1)
     .maybeSingle();
 

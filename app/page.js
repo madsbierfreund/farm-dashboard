@@ -51,13 +51,7 @@ export default async function Page({ searchParams }) {
         .gte('dosed_at', from_ts)
         .order('dosed_at', { ascending: true })
         .limit(2000),
-      db
-        .from('doser_settings')
-        .select(
-          'id, enabled, dose_above, target_ph, cooldown_minutes, max_doses_per_day, consecutive_readings, updated_at'
-        )
-        .eq('id', 1)
-        .maybeSingle(),
+      db.from('doser_settings').select('*').eq('id', 1).maybeSingle(),
       db.rpc('dose_remaining', { p_kind: 'ph_down' })
     ]);
 

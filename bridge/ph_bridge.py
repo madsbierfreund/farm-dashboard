@@ -30,12 +30,17 @@ LIVE_INTERVAL = int(os.environ.get("LIVE_INTERVAL_SECONDS", "15"))
 DOSE_URL = os.environ.get("DOSE_URL")
 ML_PER_SECOND = float(os.environ.get("ML_PER_SECOND", "0.4"))
 DOSE_TOPIC = "farm/pump/1/run"
+# EC-doseren publicerer sine doser her; vi relayer dem til /api/dose, saa
+# goedningsdoser ogsaa ses paa dashboardet.
+EC_DOSE_LOG_TOPIC = "farm/ec/dose_log"
 
-# Indstillinger fra web-panelet relayes til doseren via MQTT (retained), saa
-# doseren aldrig afhaenger af internettet ved runtime.
+# Indstillinger fra web-panelet relayes til doserne via MQTT (retained), saa
+# doserne aldrig afhaenger af internettet ved runtime. pH-felter -> farm/dose/
+# settings, EC-felter -> farm/ec/settings; hver med sin egen aendrings-detektion.
 SETTINGS_URL = os.environ.get("SETTINGS_URL")
 SETTINGS_POLL = int(os.environ.get("SETTINGS_POLL_SECONDS", "60"))
 SETTINGS_TOPIC = "farm/dose/settings"
+EC_SETTINGS_TOPIC = "farm/ec/settings"
 # Kun vaerdifelterne relayes (ikke updated_at), saa vi kun publicerer, naar de
 # faktiske vaerdier aendrede sig — ikke ved hvert gem med samme vaerdier.
 SETTINGS_FIELDS = (
@@ -45,6 +50,16 @@ SETTINGS_FIELDS = (
     "cooldown_minutes",
     "max_doses_per_day",
     "consecutive_readings",
+)
+EC_SETTINGS_FIELDS = (
+    "ec_enabled",
+    "ec_target",
+    "ec_deadband",
+    "ec_cooldown_minutes",
+    "ec_max_doses_per_day",
+    "ec_consecutive_readings",
+    "growth_stage",
+    "dose_ml_grow",
 )
 
 TOPICS = {
@@ -72,6 +87,7 @@ def on_connect(client, userdata, flags, reason_code, properties=None):
     for topic in TOPICS:
         client.subscribe(topic)
     client.subscribe(DOSE_TOPIC)
+    client.subscribe(EC_DOSE_LOG_TOPIC)
 
 
 def on_message(client, userdata, msg):
@@ -81,6 +97,13 @@ def on_message(client, userdata, msg):
         except ValueError:
             return  # ikke-numerisk varighed — ignorér
         maybe_send_dose(seconds)
+        return
+    if msg.topic == EC_DOSE_LOG_TOPIC:
+        try:
+            entry = json.loads(msg.payload.decode())
+        except ValueError:
+            return  # ugyldig JSON — ignorér
+        maybe_relay_dose(entry)
         return
     field = TOPICS.get(msg.topic)
     if field is None:
@@ -162,14 +185,8 @@ def maybe_send_live():
     threading.Thread(target=live_send, args=(snapshot,), daemon=True).start()
 
 
-def dose_send(seconds):
-    """Logger en dosering i databasen. Kaldes paa en worker-traad. Volumenet
-    udledes af koerselstiden: ml = sekunder * ML_PER_SECOND."""
-    payload = {
-        "ml": round(seconds * ML_PER_SECOND, 3),
-        "seconds": seconds,
-        "kind": "ph_down",
-    }
+def post_dose(payload):
+    """POSTer en dosering til /api/dose. Kaldes paa en worker-traad."""
     data = json.dumps(payload).encode()
     req = urllib.request.Request(
         DOSE_URL,
@@ -190,16 +207,33 @@ def dose_send(seconds):
 
 
 def maybe_send_dose(seconds):
-    """Logger en dosering off-callback, saa et langsomt eller fejlende POST
-    aldrig blokerer MQTT-callbacket."""
+    """Logger en pH-down-dosering off-callback. Volumenet udledes af
+    koerselstiden: ml = sekunder * ML_PER_SECOND."""
     if not DOSE_URL:
         return
-    threading.Thread(target=dose_send, args=(seconds,), daemon=True).start()
+    payload = {"ml": round(seconds * ML_PER_SECOND, 3), "seconds": seconds, "kind": "ph_down"}
+    threading.Thread(target=post_dose, args=(payload,), daemon=True).start()
+
+
+def maybe_relay_dose(entry):
+    """Relayer en EC-dosis fra farm/ec/dose_log til /api/dose. Volumenet er
+    allerede beregnet af EC-doseren (den kender pumpernes gennemstroemning)."""
+    if not DOSE_URL:
+        return
+    try:
+        ml = float(entry["ml"])
+    except (KeyError, TypeError, ValueError):
+        return
+    payload = {"ml": ml, "kind": str(entry.get("kind", "fertiliser"))}
+    seconds = entry.get("seconds")
+    if isinstance(seconds, (int, float)):
+        payload["seconds"] = seconds
+    threading.Thread(target=post_dose, args=(payload,), daemon=True).start()
 
 
 def fetch_settings():
-    """Henter doseringsindstillingerne fra web-appen. Returnerer et dict med
-    kun de relevante felter, eller None ved fejl/manglende raekke."""
+    """Henter alle doseringsindstillinger fra web-appen. Returnerer den raa
+    dict eller None ved fejl/manglende raekke."""
     req = urllib.request.Request(SETTINGS_URL, headers={"accept": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -209,25 +243,32 @@ def fetch_settings():
         return None
     if not isinstance(data, dict):
         return None
-    return {k: data[k] for k in SETTINGS_FIELDS if k in data}
+    return data
 
 
 def settings_poll_loop():
-    """Poller web-appen og relayer aendringer til MQTT (retained). Publicerer
-    kun naar vaerdierne faktisk aendrede sig, saa journalen ikke fyldes op."""
-    last = None
+    """Poller web-appen og relayer aendringer til MQTT (retained). pH-felterne
+    gaar til SETTINGS_TOPIC, EC-felterne til EC_SETTINGS_TOPIC — hver med sin
+    egen aendrings-detektion, saa vi kun publicerer, naar vaerdierne aendrede
+    sig, og journalen ikke fyldes op."""
+    plans = ((SETTINGS_TOPIC, SETTINGS_FIELDS), (EC_SETTINGS_TOPIC, EC_SETTINGS_FIELDS))
+    last = {topic: None for topic, _ in plans}
     time.sleep(2)  # lad MQTT-forbindelsen naa at komme op foerst
     while True:
-        settings = fetch_settings()
-        if settings is not None:
-            payload = json.dumps(settings, sort_keys=True)
-            if payload != last:
-                info = client.publish(SETTINGS_TOPIC, payload, qos=1, retain=True)
-                if info.rc == mqtt.MQTT_ERR_SUCCESS:
-                    last = payload
-                    print(f"indstillinger relayet -> {SETTINGS_TOPIC}: {payload}", flush=True)
-                else:
-                    print(f"kunne ikke publicere indstillinger (rc={info.rc})", flush=True)
+        data = fetch_settings()
+        if data is not None:
+            for topic, fields in plans:
+                sub = {k: data[k] for k in fields if k in data}
+                if not sub:
+                    continue
+                payload = json.dumps(sub, sort_keys=True)
+                if payload != last[topic]:
+                    info = client.publish(topic, payload, qos=1, retain=True)
+                    if info.rc == mqtt.MQTT_ERR_SUCCESS:
+                        last[topic] = payload
+                        print(f"indstillinger relayet -> {topic}: {payload}", flush=True)
+                    else:
+                        print(f"kunne ikke publicere indstillinger paa {topic} (rc={info.rc})", flush=True)
         time.sleep(SETTINGS_POLL)
 
 
